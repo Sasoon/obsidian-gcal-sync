@@ -1,0 +1,641 @@
+import { Extension, StateField, StateEffect, RangeSet, RangeSetBuilder, EditorState, Transaction } from "@codemirror/state"
+import { EditorView, Decoration, DecorationSet, WidgetType, ViewPlugin, ViewUpdate } from "@codemirror/view"
+import { TFile, Editor, Platform } from "obsidian"
+import type GoogleCalendarSyncPlugin from '../core/main'
+import { LogUtils } from '../utils/logUtils'
+import { ErrorUtils } from '../utils/errorUtils'
+import debounce from 'just-debounce-it'
+
+
+class ZeroWidthWidget extends WidgetType {
+    constructor(readonly content: string) {
+        super()
+    }
+
+    eq(other: ZeroWidthWidget) {
+        return other.content === this.content
+    }
+
+    toDOM() {
+        const wrap = document.createElement('span')
+        wrap.className = 'obsidian-gcal-task-id'
+        wrap.setAttribute('aria-label', 'Task ID')
+        // Extract just the ID from the comment
+        const id = this.content.match(/<!-- task-id: ([a-z0-9]+) -->/)?.[1] || ''
+        wrap.textContent = id
+        return wrap
+    }
+
+    ignoreEvent() {
+        return true
+    }
+}
+
+export class TokenController {
+    private plugin: GoogleCalendarSyncPlugin
+    private modifyLock = false
+    private readonly ID_PATTERN = /<!-- task-id: ([a-z0-9]+) -->/g
+    private lastEditTime: number = 0
+
+    constructor(plugin: GoogleCalendarSyncPlugin) {
+        this.plugin = plugin
+        this.registerEditorHandlers()
+    }
+
+    private registerEditorHandlers() {
+        // Track edits and ensure IDs stay at end of line
+        this.plugin.registerEvent(
+            this.plugin.app.workspace.on('editor-change', debounce((editor: Editor) => {
+                this.lastEditTime = Date.now()
+                this.ensureIdsAtEndOfLines(editor)
+                this.checkForNewTasks(editor)
+            }, 1000))
+        )
+
+        // Handle copy/paste to prevent ID duplication
+        this.plugin.registerEvent(
+            this.plugin.app.workspace.on('editor-paste', (evt: ClipboardEvent, editor: Editor) => {
+                const content = evt.clipboardData?.getData('text')
+                if (!content) return
+
+                // Remove any existing task IDs from pasted content
+                const newContent = content.replace(this.ID_PATTERN, '')
+                evt.clipboardData?.setData('text', newContent)
+                LogUtils.debug('Stripped task IDs from pasted content')
+            })
+        )
+
+        // Handle file modifications
+        this.plugin.registerEvent(
+            this.plugin.app.vault.on('modify', async (file: TFile) => {
+                if (this.modifyLock) return
+
+                try {
+                    this.modifyLock = true
+                    const content = await this.plugin.app.vault.read(file)
+                    const currentIds = new Set(
+                        Array.from(content.matchAll(this.ID_PATTERN))
+                            .map(match => match[1])
+                    )
+
+                    let changed = false
+                    // Only remove IDs that no longer exist in the file
+                    for (const id of Object.keys(this.plugin.settings.taskMetadata)) {
+                        if (!currentIds.has(id)) {
+                            const metadata = this.plugin.settings.taskMetadata[id];
+                            const eventId = metadata?.eventId;
+                            await this.plugin.handleTaskDeletion(id, eventId);
+                            changed = true;
+                            LogUtils.debug(`Removed orphaned task ID: ${id}`);
+                        }
+                    }
+
+                    if (changed) {
+                        await this.plugin.saveSettings()
+                    }
+                } catch (error) {
+                    LogUtils.error(`File modification handler error: ${error}`)
+                } finally {
+                    this.modifyLock = false
+                }
+            })
+        )
+    }
+
+    private checkForNewTasks(editor: Editor) {
+        // @ts-ignore - cm exists on editor but is not typed
+        const view = editor.cm as EditorView
+        if (!view) return
+
+        const doc = view.state.doc
+        for (let i = 1; i <= doc.lines; i++) {
+            const line = doc.line(i)
+            if (line.text.match(/^\s*- \[[ x]\] /) && !line.text.match(this.ID_PATTERN)) {
+                LogUtils.debug(`Found new task at line ${i}: ${line.text}`)
+                this.generateTaskId(view, line.from)
+            }
+        }
+    }
+
+    private ensureIdsAtEndOfLines(editor: Editor) {
+        // @ts-ignore - cm exists on editor but is not typed
+        const view = editor.cm as EditorView
+        if (!view) return
+
+        const doc = view.state.doc
+        const changes: { from: number, to: number, insert: string }[] = []
+
+        for (let i = 1; i <= doc.lines; i++) {
+            const line = doc.line(i)
+            const taskMatch = line.text.match(/^.*?- \[[ x]\].*?(<!-- task-id: [a-z0-9]+ -->)/)
+            if (taskMatch) {
+                const idIndex = line.text.indexOf('<!-- task-id:')
+                if (idIndex >= 0 && idIndex < line.text.length - taskMatch[1].length) {
+                    // ID exists but is not at the end of the line
+                    const beforeId = line.text.slice(0, idIndex)
+                    const afterId = line.text.slice(idIndex + taskMatch[1].length)
+                    const newLine = beforeId + afterId.trim() + ' ' + taskMatch[1]
+
+                    if (newLine !== line.text) {
+                        changes.push({
+                            from: line.from,
+                            to: line.to,
+                            insert: newLine
+                        })
+                    }
+                }
+            }
+        }
+
+        if (changes.length > 0) {
+            view.dispatch({ changes })
+        }
+    }
+
+    public getExtension(): Extension[] {
+        const idPattern = this.ID_PATTERN;
+        const plugin = this.plugin;
+        const controller = this;
+
+        // Create a ViewPlugin to handle task creation in real-time
+        const taskCreationPlugin = ViewPlugin.fromClass(class {
+            private lastChangeTime = 0;
+
+            update(update: ViewUpdate) {
+                if (!update.docChanged) return;
+
+                const currentTime = Date.now();
+                if (currentTime - this.lastChangeTime < 100) return; // Debounce rapid changes
+                this.lastChangeTime = currentTime;
+
+                // Check for new tasks in changed ranges
+                update.changes.iterChangedRanges((fromA, toA, fromB, toB) => {
+                    const doc = update.view.state.doc;
+                    const startLine = doc.lineAt(fromB);
+                    const endLine = doc.lineAt(toB);
+
+                    for (let pos = startLine.from; pos <= endLine.to;) {
+                        const line = doc.lineAt(pos);
+                        if (line.text.match(/^\s*- \[[ x]\] /) && !line.text.match(idPattern)) {
+                            LogUtils.debug(`Real-time task detection: Found new task at line ${line.number}`);
+                            controller.generateTaskId(update.view, line.from);
+                        }
+                        pos = line.to + 1;
+                    }
+                });
+            }
+        });
+
+        const taskIdField = StateField.define<DecorationSet>({
+            create() {
+                return Decoration.none
+            },
+            update(oldSet, tr) {
+                // Only prevent standalone deletion of task IDs
+                if (tr.changes.length > 0) {
+                    const newDoc = tr.newDoc.toString();
+                    const oldDoc = tr.startState.doc.toString();
+
+                    // Get all task lines and their IDs from both states
+                    const oldMatches = Array.from(oldDoc.matchAll(/^.*?- \[[ x]\].*?(<!-- task-id: [a-z0-9]+ -->)/gm));
+                    const newMatches = Array.from(newDoc.matchAll(/^.*?- \[[ x]\].*?(<!-- task-id: [a-z0-9]+ -->)/gm));
+
+                    // If we have fewer task IDs but the same number of tasks, prevent the change
+                    // This catches standalone ID deletions while allowing task operations
+                    if (oldMatches.length === newMatches.length &&
+                        oldMatches.length > Array.from(newDoc.matchAll(idPattern)).length) {
+                        return oldSet;
+                    }
+                }
+
+                const builder = new RangeSetBuilder<Decoration>()
+                const decorations: Array<{
+                    from: number,
+                    to: number,
+                    decoration: Decoration
+                }> = []
+
+                // First collect all decorations
+                for (let pos = 0; pos < tr.state.doc.length;) {
+                    const line = tr.state.doc.lineAt(pos)
+                    let match
+
+                    idPattern.lastIndex = 0
+                    while ((match = idPattern.exec(line.text)) !== null) {
+                        const from = line.from + match.index
+                        const to = from + match[0].length
+
+                        // Replace the ID with a widget and make it atomic
+                        decorations.push({
+                            from,
+                            to,
+                            decoration: Decoration.replace({
+                                widget: new ZeroWidthWidget(match[0]),
+                                block: false,
+                                side: 1  // Changed to 1 to prefer end of line
+                            })
+                        })
+                    }
+                    pos = line.to + 1
+                }
+
+                // Sort decorations by position
+                decorations.sort((a, b) => a.from - b.from)
+
+                // Add sorted decorations to builder
+                for (const { from, to, decoration } of decorations) {
+                    builder.add(from, to, decoration)
+                }
+
+                return builder.finish()
+            },
+            provide: f => EditorView.decorations.from(f)
+        })
+
+        // Enhanced atomic ranges to prevent selective deletion of IDs, but allow line deletion
+        const atomicRanges = EditorView.atomicRanges.of(view => {
+            const builder = new RangeSetBuilder();
+            const content = view.state.doc.toString();
+            let match;
+
+            // Reset lastIndex to ensure we start from the beginning
+            this.ID_PATTERN.lastIndex = 0;
+
+            // First check if this is a large-scale deletion (multiple lines)
+            // We don't want to interfere with multi-line deletions or cut operations
+            const selection = view.state.selection;
+            const hasLargeSelection = selection.ranges.some(range =>
+                range.to - range.from > 10 || // More than a few characters
+                content.slice(range.from, range.to).includes('\n') // Multi-line selection
+            );
+
+            // If there's a large selection active, don't make IDs atomic to allow deletion
+            if (hasLargeSelection) {
+                return builder.finish();
+            }
+
+            while ((match = this.ID_PATTERN.exec(content)) !== null) {
+                if (match.index !== undefined) {
+                    // Only make task IDs atomic inside task lines - not when selecting whole lines
+                    const lineStart = content.lastIndexOf('\n', match.index) + 1;
+                    let lineEnd = content.indexOf('\n', match.index);
+                    if (lineEnd === -1) lineEnd = content.length;
+
+                    // Check if the line contains a task
+                    const line = content.slice(lineStart, lineEnd);
+                    const isTaskLine = line.match(/^.*?- \[[ xX]\]/);
+
+                    // Make the ID atomic only if it's in a task line and not being deleted as part of the whole line
+                    if (isTaskLine) {
+                        builder.add(
+                            match.index,
+                            match.index + match[0].length,
+                            Decoration.mark({
+                                inclusive: false,
+                                atomic: true
+                            })
+                        );
+                    }
+                }
+            }
+
+            return builder.finish();
+        });
+
+        // Add transaction filter to prevent ID modifications except in whole task operations
+        const preventDeletion = EditorState.transactionFilter.of(tr => {
+            if (!tr.changes.length) return tr;
+
+            let changes: { from: number, to: number, insert: string }[] = [];
+            let shouldBlock = false;
+
+            tr.changes.iterChanges((fromA, toA, fromB, toB, inserted) => {
+                const line = tr.startState.doc.lineAt(fromA);
+                const taskMatch = line.text.match(/^.*?- \[[ xX]\].*?(<!-- task-id: [a-z0-9]+ -->)/);
+                const insertedText = inserted.toString();
+
+                // Allow complete line deletion (when a line is fully deleted and replaced with nothing)
+                // Or when the line is part of a larger deletion (multi-line delete or cut)
+                const isLineDeletion =
+                    (toA - fromA >= line.length && inserted.length === 0) || // Full line deletion
+                    (toA - fromA > 0 && line.text.includes(this.ID_PATTERN.source) && inserted.length === 0); // Partial containing ID
+
+                if (isLineDeletion) {
+                    // Handle task deletion logic in background
+                    if (taskMatch) {
+                        const idMatch = line.text.match(this.ID_PATTERN);
+                        if (idMatch && idMatch[1]) {
+                            const taskId = idMatch[1];
+                            LogUtils.debug(`Task line deletion detected for task ${taskId}`);
+
+                            // Schedule task cleanup asynchronously with a short delay
+                            // to ensure the edit completes first
+                            setTimeout(() => {
+                                try {
+                                    const metadata = this.plugin.settings.taskMetadata[taskId];
+                                    this.plugin.handleTaskDeletion(taskId, metadata?.eventId)
+                                        .catch(error => LogUtils.error(`Error cleaning up deleted task ${taskId}: ${error}`));
+                                } catch (error) {
+                                    LogUtils.error(`Error scheduling task deletion for ${taskId}: ${error}`);
+                                }
+                            }, 100);
+                        }
+                    }
+                    return; // Always allow line deletions
+                }
+
+                if (taskMatch) {
+                    const idIndex = line.text.indexOf('<!-- task-id:');
+                    const idStartIndex = idIndex + '<!-- task-id: '.length;
+                    const idEndIndex = idIndex + taskMatch[1].length - ' -->'.length;
+                    const changeIndex = fromA - line.from;
+
+                    // Check if this is a line break
+                    if (insertedText.includes('\n')) {
+                        // Only block if breaking within the actual ID
+                        if (changeIndex > idStartIndex && changeIndex < idEndIndex) {
+                            shouldBlock = true;
+                            return;
+                        }
+
+                        // If breaking before the ID, move it to stay with the task header
+                        if (changeIndex < idIndex) {
+                            const beforeBreak = line.text.slice(0, fromA - line.from + 1);
+                            const afterBreak = line.text.slice(fromA - line.from + 1, idIndex).trimLeft();
+                            const id = taskMatch[1];
+                            const restContent = line.text.slice(idIndex + taskMatch[1].length);
+
+                            changes.push({
+                                from: line.from,
+                                to: line.to,
+                                insert: beforeBreak + id + '\n' + afterBreak + restContent
+                            });
+                        }
+
+                        // Always allow the line break to proceed
+                        return;
+                    }
+
+                    // Check if this is a whole task operation
+                    const isWholeTaskOperation =
+                        // Entire line is being modified
+                        (line.text.trim() === tr.startState.sliceDoc(fromA, toA).trim()) ||
+                        // New task is being pasted
+                        (insertedText.match(/^- \[[ xX]\]/));
+
+                    // Block if trying to modify just the ID
+                    if (!isWholeTaskOperation &&
+                        changeIndex > idStartIndex && changeIndex < idEndIndex) {
+                        shouldBlock = true;
+                        return;
+                    }
+                }
+
+                // Check for standalone ID deletion (but not if deleting the entire line)
+                const deletedText = tr.startState.sliceDoc(fromA, toA);
+                if (deletedText.match(this.ID_PATTERN) &&
+                    !deletedText.match(/^.*?- \[[ xX]\]/) &&
+                    !insertedText.match(/^.*?- \[[ xX]\]/) &&
+                    !isLineDeletion) {
+                    shouldBlock = true;
+                    return;
+                }
+            });
+
+            if (shouldBlock) {
+                return [];
+            }
+
+            if (changes.length > 0) {
+                return [tr, { changes }];
+            }
+
+            return tr;
+        });
+
+        // Add reminder shortcut conversion
+        const reminderConverter = EditorState.transactionFilter.of(tr => {
+            if (!tr.docChanged) return tr;
+
+            const changes: { from: number, to: number, insert: string }[] = [];
+            const doc = tr.newDoc;
+
+            tr.changes.iterChanges((fromA, toA, fromB, toB, inserted) => {
+                const text = inserted.toString();
+                if (text !== 'r') return;
+
+                // Get the line and ensure it's a task
+                const line = doc.lineAt(fromB);
+                if (!line.text.match(/^- \[[ x]\]/)) return;
+
+                // Look back for '@' character
+                const beforePos = fromB - 1;
+                if (beforePos < line.from) return;
+
+                const beforeChar = doc.sliceString(beforePos, fromB);
+                if (beforeChar !== '@') return;
+
+                // Create a single atomic transaction
+                changes.push({
+                    from: beforePos,
+                    to: fromB + text.length,
+                    insert: "🔔"
+                });
+            });
+
+            if (!changes.length) return tr;
+
+            // Create a new transaction with our changes
+            return [tr, {
+                changes,
+                sequential: true
+            }];
+        });
+
+        return [
+            taskIdField,
+            atomicRanges,
+            preventDeletion,
+            reminderConverter,
+            taskCreationPlugin
+        ];
+    }
+
+    // Private implementation of generateTaskId
+    private _generateTaskId(view: EditorView, pos: number): string {
+        try {
+            // Import the IdUtils class we created for mobile compatibility
+            // Using delayed import to avoid potential issues on load
+            const { IdUtils } = require('../utils/idUtils');
+
+            // Generate a time-based ID for better uniqueness
+            const id = IdUtils.generateTimeBasedId();
+            const now = Date.now();
+            const line = view.state.doc.lineAt(pos);
+            const file = this.plugin.app.workspace.getActiveFile();
+            if (!file) {
+                LogUtils.error('No active file found');
+                return '';
+            }
+
+            LogUtils.debug('Generating ID for line:', line.text);
+
+            // Check if line already has an ID
+            if (line.text.match(this.ID_PATTERN)) {
+                LogUtils.debug('Line already has an ID');
+                return '';
+            }
+
+            // Check if this is a task line
+            const taskMatch = line.text.match(/^\s*- \[[ x]\] (.+)/)
+            if (!taskMatch) {
+                LogUtils.debug('Not a task line');
+                return '';
+            }
+
+            // Find the end of the task header line (before any indented content)
+            let headerEndPos = line.to;
+            let currentLine = line;
+            let nextLinePos = currentLine.to + 1;
+
+            // Look ahead to check for indented content
+            while (nextLinePos < view.state.doc.length) {
+                const nextLine = view.state.doc.lineAt(nextLinePos);
+                if (!nextLine.text.startsWith('    ')) {
+                    break;
+                }
+                currentLine = nextLine;
+                nextLinePos = currentLine.to + 1;
+            }
+
+            const taskContent = taskMatch[1];
+
+            // Create the task ID without extra space
+            const taskId = `<!-- task-id: ${id} -->`;
+
+            // Initialize metadata for the task BEFORE updating the view
+            this.plugin.settings.taskMetadata[id] = {
+                filePath: file.path,
+                eventId: '',
+                title: taskContent,
+                date: new Date().toISOString().split('T')[0],
+                completed: line.text.includes('[x]') || line.text.includes('[X]'),
+                lastModified: now,
+                lastSynced: now,
+                createdAt: now
+            };
+
+            // Save settings first
+            this.plugin.saveSettings();
+
+            // Use setTimeout to defer the view update to the next event cycle
+            // This prevents "update during update" errors
+            setTimeout(() => {
+                try {
+                    const transaction = view.state.update({
+                        changes: { from: headerEndPos, insert: taskId }
+                    });
+                    view.dispatch(transaction);
+                    LogUtils.debug(`Successfully added ID: ${id} to task: ${taskContent}`);
+                } catch (error) {
+                    LogUtils.error(`Failed to dispatch task ID update: ${error}`);
+                }
+            }, 0);
+
+            return id;
+        } catch (error) {
+            LogUtils.error(`Failed to generate task ID: ${error}`);
+            return '';
+        }
+    }
+
+    // Public method for generating task IDs with controlled debouncing
+    // We maintain an internal queue to ensure we process all tasks even under high load
+    private taskIdGenQueue: Array<{ view: EditorView, pos: number, time: number }> = [];
+    private isProcessingQueue = false;
+
+    private async processTaskIdGenQueue() {
+        if (this.isProcessingQueue || this.taskIdGenQueue.length === 0) return;
+
+        try {
+            this.isProcessingQueue = true;
+
+            // Sort by time (oldest first)
+            this.taskIdGenQueue.sort((a, b) => a.time - b.time);
+
+            // Process up to 5 items at a time
+            const batch = this.taskIdGenQueue.splice(0, 5);
+
+            for (const item of batch) {
+                try {
+                    // Add a small delay before checking to ensure editor state is stable
+                    await new Promise(resolve => setTimeout(resolve, 10));
+
+                    const line = item.view.state.doc.lineAt(item.pos);
+
+                    // Only generate ID if line is a task and doesn't already have an ID
+                    if (line.text.match(/^\s*- \[[ x]\] /) && !line.text.match(this.ID_PATTERN)) {
+                        const id = this._generateTaskId(item.view, item.pos);
+                        if (id) {
+                            LogUtils.debug(`Added ID to new task: ${id}`);
+                        }
+                    }
+                } catch (error) {
+                    LogUtils.error(`Error processing task ID generation for item: ${error}`);
+                }
+
+                // Increased pause between operations to prevent editor lag and allow
+                // previous updates to complete
+                await new Promise(resolve => setTimeout(resolve, 150));
+            }
+        } catch (error) {
+            LogUtils.error(`Error processing task ID queue: ${error}`);
+        } finally {
+            this.isProcessingQueue = false;
+
+            // If more items remain, continue processing after a longer delay
+            // to ensure the editor has fully processed previous updates
+            if (this.taskIdGenQueue.length > 0) {
+                setTimeout(() => this.processTaskIdGenQueue(), 250);
+            }
+        }
+    }
+
+    public generateTaskId = (view: EditorView, pos: number): void => {
+        // Add to queue
+        this.taskIdGenQueue.push({
+            view,
+            pos,
+            time: Date.now()
+        });
+
+        // Start processing if not already doing so
+        if (!this.isProcessingQueue) {
+            this.processTaskIdGenQueue();
+        }
+    }
+
+    public getTaskId(state: EditorState, pos: number): string | null {
+        try {
+            const line = state.doc.lineAt(pos)
+            // For single match operations, create a non-global version of the pattern
+            const singleMatchPattern = /<!-- task-id: ([a-z0-9]+) -->/
+            const match = line.text.match(singleMatchPattern)
+            return match ? match[1] : null
+        } catch (error) {
+            LogUtils.error(`Error getting task ID: ${error}`)
+            return null
+        }
+    }
+
+    public debugIds(state: EditorState) {
+        LogUtils.debug('Task IDs in document:')
+        const lines = state.doc.toString().split('\n')
+        lines.forEach((line, index) => {
+            const match = line.match(this.ID_PATTERN)
+            if (match) {
+                LogUtils.debug(`Line ${index + 1}: ID ${match[1]}`)
+            }
+        })
+    }
+}

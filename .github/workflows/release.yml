@@ -1,0 +1,39 @@
+name: Release Obsidian Plugin
+on:
+  push:
+    tags:
+      - "*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18.x'
+          
+      - name: Install dependencies
+        run: npm ci
+        
+      - name: Build plugin
+        run: npm run build
+        
+      - name: Create release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          
+          # Create a zip file with the built plugin
+          mkdir ${{ github.event.repository.name }}
+          cp main.js manifest.json styles.css README.md LICENSE ${{ github.event.repository.name }}
+          zip -r ${{ github.event.repository.name }}.zip ${{ github.event.repository.name }}
+          
+          # Create GitHub release
+          gh release create "$tag" \
+            --title="$tag" \
+            --notes="See the changelog in README.md for details." \
+            ${{ github.event.repository.name }}.zip main.js manifest.json styles.css 

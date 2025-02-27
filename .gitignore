@@ -1,0 +1,38 @@
+# Node dependency directories
+node_modules/
+
+# Build output
+main.js
+*.js.map
+
+# Environment variables and secrets
+.env
+.env.local
+.env.development
+.env.test
+.env.production
+googleConfig.json
+credentials.json
+token.json
+*-credentials.json
+*-token.json
+*-secret.json
+*-secret.txt
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Debug logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# IDE/editor directories
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local scripts
+plugin-reload.sh 

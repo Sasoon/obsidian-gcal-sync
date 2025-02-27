@@ -1,0 +1,45 @@
+{
+    "name": "obsidian-gcal-sync",
+    "version": "1.0.0",
+    "description": "Sync Obsidian tasks with Google Calendar",
+    "main": "main.js",
+    "scripts": {
+        "dev": "node esbuild.config.mjs",
+        "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+        "version": "node version-bump.mjs && git add manifest.json versions.json"
+    },
+    "keywords": [
+        "obsidian",
+        "google-calendar",
+        "tasks"
+    ],
+    "author": "Sasoon Sarkisian",
+    "license": "MIT",
+    "devDependencies": {
+        "@codemirror/commands": "^6.7.1",
+        "@types/codemirror": "^5.60.15",
+        "@types/dotenv": "^6.1.1",
+        "@types/node": "16.11.6",
+        "@types/uuid": "^10.0.0",
+        "@typescript-eslint/eslint-plugin": "5.2.0",
+        "@typescript-eslint/parser": "5.2.0",
+        "builtin-modules": "3.2.0",
+        "esbuild": "^0.19.0",
+        "obsidian": "1.4.11",
+        "tslib": "2.3.1",
+        "typescript": "5.5.4"
+    },
+    "dependencies": {
+        "@codemirror/autocomplete": "^6.18.4",
+        "@codemirror/language": "^6.10.7",
+        "@codemirror/state": "^6.2.1",
+        "@codemirror/view": "^6.21.3",
+        "@googleapis/oauth2": "^1.0.0",
+        "dotenv": "^16.4.1",
+        "googleapis": "^128.0.0",
+        "googleapis-common": "^7.2.0",
+        "immer": "^10.1.1",
+        "just-debounce-it": "^3.2.0",
+        "zustand": "^5.0.3"
+    }
+}

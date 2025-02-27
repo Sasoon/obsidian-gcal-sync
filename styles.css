@@ -1,0 +1,177 @@
+/* Hide task IDs */
+.task-id-comment,
+[data-task-id="true"] {
+    display: none !important;
+    opacity: 0 !important;
+    width: 0 !important;
+    height: 0 !important;
+    position: absolute !important;
+    pointer-events: none !important;
+    user-select: none !important;
+    cursor: default !important;
+    font-size: 0 !important;
+    line-height: 0 !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    border: 0 !important;
+    overflow: hidden !important;
+    white-space: nowrap !important;
+    text-indent: -9999px !important;
+}
+
+/* Hide the task ID widget */
+.task-id-widget {
+    display: none !important;
+}
+
+/* Ensure task ID doesn't affect layout */
+.task-id-comment::before,
+.task-id-comment::after,
+[data-task-id="true"]::before,
+[data-task-id="true"]::after {
+    content: none !important;
+}
+
+/* Ribbon icon status styles */
+.ribbon-icon.calendar-clock {
+    opacity: 0.8;
+    transition: all 0.2s ease;
+}
+
+.ribbon-icon.calendar-clock.is-connected {
+    opacity: 1;
+    color: var(--interactive-success);
+}
+
+.ribbon-icon.calendar-clock.is-syncing {
+    opacity: 1;
+    color: var(--interactive-accent);
+    animation: spin 2s linear infinite;
+}
+
+.ribbon-icon.calendar-clock.is-error {
+    opacity: 1;
+    color: var(--text-error);
+}
+
+.ribbon-icon.calendar-clock.is-disconnected {
+    opacity: 0.5;
+    color: var(--text-muted);
+}
+
+@keyframes spin {
+    from {
+        transform: rotate(0deg);
+    }
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+/* Task ID Styles */
+.obsidian-gcal-task-id {
+    display: inline-block !important;
+    background-color: #f0f0f0;
+    border-radius: 4px;
+    padding: 0 6px;
+    margin-left: 8px;
+    font-size: 0.85em;
+    color: #666;
+    font-family: var(--font-monospace);
+    user-select: none;
+    cursor: default;
+    vertical-align: middle;
+}
+
+/* Dark theme support */
+.theme-dark .obsidian-gcal-task-id {
+    background-color: #2a2a2a;
+    color: #999;
+}
+
+/* Make sure the ID stays on the same line as the task */
+.task-list-item {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+}
+
+/* Ensure proper spacing in reading view */
+.markdown-preview-view .obsidian-gcal-task-id {
+    margin-left: 8px;
+}
+
+.obsidian-gcal-task-id-hidden {
+    display: none !important;
+    width: 0 !important;
+    height: 0 !important;
+    position: absolute !important;
+    overflow: hidden !important;
+    opacity: 0 !important;
+    pointer-events: none !important;
+    user-select: none !important;
+}
+
+/* Ensure proper cursor behavior */
+.cm-line {
+    position: relative !important;
+}
+
+/* Remove any potential spacing from task IDs */
+.obsidian-gcal-task-id::before,
+.obsidian-gcal-task-id::after,
+.obsidian-gcal-task-id-hidden::before,
+.obsidian-gcal-task-id-hidden::after {
+    content: none !important;
+    display: none !important;
+}
+
+/* Reminder suggestions */
+.gcal-reminder-suggestion {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 4px 8px;
+}
+
+.gcal-reminder-label {
+    color: var(--text-normal);
+    font-size: var(--font-ui-small);
+}
+
+.gcal-reminder-detail {
+    color: var(--text-muted);
+    font-size: var(--font-ui-smaller);
+}
+
+/* Settings styles */
+.plugin-info {
+    padding: 10px;
+    margin: 10px 0;
+    border-radius: 5px;
+    background-color: var(--background-secondary);
+}
+
+.syntax-info {
+    padding: 10px;
+    margin: 10px 0;
+    border-radius: 5px;
+    background-color: var(--background-secondary);
+}
+
+.syntax-info code {
+    display: block;
+    padding: 8px;
+    margin: 8px 0;
+    background-color: var(--background-primary);
+    border-radius: 4px;
+    font-family: var(--font-monospace);
+}
+
+.syntax-info ul {
+    margin-left: 20px;
+}
+
+.syntax-info li {
+    margin: 5px 0;
+}
