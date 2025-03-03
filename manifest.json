@@ -1,8 +1,8 @@
 {
     "id": "obsidian-gcal-sync",
-    "protocols": ["googleLogin", "auth/gcalsync"],
+    "protocols": ["googleLogin", "auth/gcalsync", "com.obsidian.gcalsync"],
     "name": "Google Calendar Sync",
-    "version": "1.0.12",
+    "version": "1.0.123",
     "minAppVersion": "0.15.0",
     "description": "Sync Obsidian tasks with Google Calendar",
     "author": "Sasoon Sarkisian",

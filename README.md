@@ -63,3 +63,42 @@ For issues, questions, or feature requests, please visit the [GitHub repository]
 ## License
 
 MIT
+
+## Google Cloud Console Configuration
+
+For the OAuth flow to work correctly, you need to configure your Google Cloud Console project with the following settings:
+
+1. Go to the [Google Cloud Console](https://console.cloud.google.com/)
+2. Select your project
+3. Navigate to "APIs & Services" > "Credentials"
+4. Edit your OAuth 2.0 Client ID
+5. Add the following authorized redirect URIs:
+   - For desktop: `http://127.0.0.1:8085/callback`
+   - For mobile: `https://obsidian-gcal-sync-netlify-oauth.netlify.app/redirect.html`
+6. Add the following authorized JavaScript origins:
+   - `https://obsidian-gcal-sync-netlify-oauth.netlify.app`
+   - `https://obsidian.md`
+7. Make sure your application type is set to "Web application" (not Android or iOS)
+8. Save your changes
+
+**Important**: The redirect URIs must match exactly what's configured in the code. The mobile authentication flow uses Obsidian's built-in URL handling to capture the OAuth callback.
+
+## Performance Optimizations
+
+This plugin includes several optimizations to make synchronization efficient and reliable:
+
+1. **Task Queue Deduplication**: Prevents duplicate tasks from being added to the sync queue, reducing redundant processing.
+
+2. **Smart Change Detection**: Tasks are only synced when they've actually changed, significantly reducing unnecessary API calls.
+  
+3. **Adaptive Debouncing**: Dynamically adjusts sync timing based on queue size and recent sync activity.
+
+4. **Efficient File Reading**: Processes tasks by file rather than individually, greatly reducing redundant file reads.
+
+5. **Task Batching**: Groups similar tasks together in batches for more efficient processing.
+
+6. **Enhanced Caching**: Improved caching of task states and file contents reduces redundant parsing.
+
+7. **Improved Process Management**: Better handling of concurrent sync processes prevents orphaned intervals and lock states.
+
+These optimizations help ensure that synchronization is fast, stable, and resource-efficient, even with large numbers of tasks.

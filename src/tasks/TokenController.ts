@@ -35,6 +35,7 @@ export class TokenController {
     private plugin: GoogleCalendarSyncPlugin
     private modifyLock = false
     private readonly ID_PATTERN = /<!-- task-id: ([a-z0-9]+) -->/g
+    private readonly COMPLETION_PATTERN = /✅ \d{4}-\d{2}-\d{2}/g
     private lastEditTime: number = 0
 
     constructor(plugin: GoogleCalendarSyncPlugin) {
@@ -43,12 +44,13 @@ export class TokenController {
     }
 
     private registerEditorHandlers() {
-        // Track edits and ensure IDs stay at end of line
+        // Track edits and ensure IDs stay at end of lines
         this.plugin.registerEvent(
             this.plugin.app.workspace.on('editor-change', debounce((editor: Editor) => {
                 this.lastEditTime = Date.now()
                 this.ensureIdsAtEndOfLines(editor)
                 this.checkForNewTasks(editor)
+                this.handleTaskCompletionChanges(editor)
             }, 1000))
         )
 
@@ -102,6 +104,64 @@ export class TokenController {
         )
     }
 
+    /**
+     * Handles task completion status changes, specifically handling the cleanup 
+     * of completion markers when a task is unticked
+     */
+    private handleTaskCompletionChanges(editor: Editor) {
+        // @ts-ignore - cm exists on editor but is not typed
+        const view = editor.cm as EditorView
+        if (!view) return
+
+        const doc = view.state.doc
+        const changes: { from: number, to: number, insert: string }[] = []
+
+        for (let i = 1; i <= doc.lines; i++) {
+            const line = doc.line(i)
+            // Look for unchecked tasks with task IDs
+            if (line.text.match(/^\s*- \[ \].*?<!-- task-id: ([a-z0-9]+) -->/)) {
+                // Check if there are completion markers to clean up
+                const hasCompletionMarkers = line.text.match(this.COMPLETION_PATTERN)
+
+                if (hasCompletionMarkers) {
+                    LogUtils.debug(`Found unticked task with completion markers: ${line.text}`)
+
+                    // Get task ID
+                    const idMatch = line.text.match(this.ID_PATTERN)
+                    const taskId = idMatch ? idMatch[1] : null
+
+                    // Remove all completion markers from the line
+                    let newLine = line.text.replace(this.COMPLETION_PATTERN, '')
+                    // Clean up any extra whitespace
+                    newLine = newLine.replace(/\s+/g, ' ').trim()
+
+                    // Ensure ID is at the end of the line
+                    if (taskId) {
+                        const taskIdText = `<!-- task-id: ${taskId} -->`
+                        // Remove the ID first
+                        newLine = newLine.replace(this.ID_PATTERN, '')
+                        // Add it back at the end
+                        newLine = newLine.trim() + ' ' + taskIdText
+                    }
+
+                    LogUtils.debug(`Cleaning up completion markers in unticked task: ${taskId}`)
+                    LogUtils.debug(`Original line: ${line.text}`)
+                    LogUtils.debug(`Updated line: ${newLine}`)
+
+                    changes.push({
+                        from: line.from,
+                        to: line.to,
+                        insert: newLine
+                    })
+                }
+            }
+        }
+
+        if (changes.length > 0) {
+            view.dispatch({ changes })
+        }
+    }
+
     private checkForNewTasks(editor: Editor) {
         // @ts-ignore - cm exists on editor but is not typed
         const view = editor.cm as EditorView
@@ -127,16 +187,77 @@ export class TokenController {
 
         for (let i = 1; i <= doc.lines; i++) {
             const line = doc.line(i)
-            const taskMatch = line.text.match(/^.*?- \[[ x]\].*?(<!-- task-id: [a-z0-9]+ -->)/)
-            if (taskMatch) {
-                const idIndex = line.text.indexOf('<!-- task-id:')
-                if (idIndex >= 0 && idIndex < line.text.length - taskMatch[1].length) {
-                    // ID exists but is not at the end of the line
-                    const beforeId = line.text.slice(0, idIndex)
-                    const afterId = line.text.slice(idIndex + taskMatch[1].length)
-                    const newLine = beforeId + afterId.trim() + ' ' + taskMatch[1]
+            // Look for tasks with task IDs
+            const taskIdMatches = [...line.text.matchAll(this.ID_PATTERN)]
 
-                    if (newLine !== line.text) {
+            if (taskIdMatches.length > 0 && line.text.match(/^.*?- \[[ x]\].*/)) {
+                // Check if there are multiple IDs (the issue)
+                if (taskIdMatches.length > 1) {
+                    LogUtils.debug(`Found multiple task IDs in line: ${line.text}`)
+
+                    // Keep only the first ID
+                    const firstId = taskIdMatches[0][0]
+                    // Remove all IDs from the line
+                    let newLine = line.text.replace(this.ID_PATTERN, '')
+                    // Clean up any extra whitespace
+                    newLine = newLine.replace(/\s+/g, ' ').trim()
+                    // Add the ID back at the end
+                    newLine = newLine + ' ' + firstId
+
+                    changes.push({
+                        from: line.from,
+                        to: line.to,
+                        insert: newLine
+                    })
+                }
+                // If ID exists but is not at the end of the line
+                else {
+                    const idMatch = taskIdMatches[0]
+                    const idIndex = idMatch.index
+                    const idText = idMatch[0]
+
+                    if (idIndex !== undefined && idIndex < line.text.length - idText.length) {
+                        // Remove the ID from its current position
+                        let newLine = line.text.replace(idText, '')
+                        // Clean up any extra whitespace
+                        newLine = newLine.replace(/\s+/g, ' ').trim()
+                        // Add the ID back at the end
+                        newLine = newLine + ' ' + idText
+
+                        if (newLine !== line.text) {
+                            changes.push({
+                                from: line.from,
+                                to: line.to,
+                                insert: newLine
+                            })
+                        }
+                    }
+                }
+
+                // NEW: Check for unchecked tasks with completion markers
+                const isUnchecked = line.text.match(/^.*?- \[ \].*/)
+                if (isUnchecked) {
+                    const hasCompletionMarkers = line.text.match(this.COMPLETION_PATTERN)
+                    if (hasCompletionMarkers) {
+                        LogUtils.debug(`Found unticked task with completion markers during ID check: ${line.text}`)
+
+                        // Get the current ID
+                        const taskId = taskIdMatches[0][1]
+
+                        // Create a new line without completion markers
+                        let newLine = line.text.replace(this.COMPLETION_PATTERN, '')
+                        // Clean up any extra whitespace
+                        newLine = newLine.replace(/\s+/g, ' ').trim()
+
+                        // Remove the ID
+                        newLine = newLine.replace(this.ID_PATTERN, '').trim()
+                        // Add it back at the end
+                        newLine = newLine + ' ' + taskIdMatches[0][0]
+
+                        LogUtils.debug(`Cleaning up completion markers in unticked task during ID check: ${taskId}`)
+                        LogUtils.debug(`Original line: ${line.text}`)
+                        LogUtils.debug(`Updated line: ${newLine}`)
+
                         changes.push({
                             from: line.from,
                             to: line.to,
@@ -181,6 +302,73 @@ export class TokenController {
                             controller.generateTaskId(update.view, line.from);
                         }
                         pos = line.to + 1;
+                    }
+                });
+            }
+        });
+
+        // Add task completion state change detector
+        const taskCompletionPlugin = ViewPlugin.fromClass(class {
+            private lastChangeTime = 0;
+
+            update(update: ViewUpdate) {
+                if (!update.docChanged) return;
+
+                const currentTime = Date.now();
+                if (currentTime - this.lastChangeTime < 100) return; // Debounce rapid changes
+                this.lastChangeTime = currentTime;
+
+                // Process changes to detect task toggling
+                update.changes.iterChangedRanges((fromA, toA, fromB, toB) => {
+                    const oldDoc = update.startState.doc;
+                    const newDoc = update.state.doc;
+
+                    // Find the lines of the changes
+                    const oldStartLine = oldDoc.lineAt(fromA);
+                    const newStartLine = newDoc.lineAt(fromB);
+
+                    // Check if this might be a task checkbox toggle
+                    const oldLineText = oldStartLine.text;
+                    const newLineText = newStartLine.text;
+
+                    // Check if the line had an ID (to ensure we're dealing with our tracked tasks)
+                    const taskIdMatch = newLineText.match(controller.ID_PATTERN);
+                    if (!taskIdMatch) return;
+
+                    const taskId = taskIdMatch[1];
+
+                    // Check if this is a task being unticked (checkbox state changed from '[x]' to '[ ]')
+                    const wasChecked = oldLineText.match(/^\s*- \[[xX]\]/);
+                    const isNowUnchecked = newLineText.match(/^\s*- \[ \]/);
+
+                    if (wasChecked && isNowUnchecked) {
+                        LogUtils.debug(`Task ${taskId} was unticked - will remove completion markers`);
+
+                        // Look for completion markers on the line
+                        const hasCompletionMarkers = newLineText.match(controller.COMPLETION_PATTERN);
+
+                        if (hasCompletionMarkers) {
+                            LogUtils.debug(`Detected completion markers on unticked task ${taskId} - cleaning up`);
+
+                            // Remove all completion markers
+                            let cleanedLine = newLineText.replace(controller.COMPLETION_PATTERN, '');
+                            // Clean up extra whitespace
+                            cleanedLine = cleanedLine.replace(/\s+/g, ' ').trim();
+
+                            // Ensure the ID is at the end
+                            // Remove the ID
+                            cleanedLine = cleanedLine.replace(controller.ID_PATTERN, '').trim();
+                            // Add it back at the end
+                            cleanedLine = cleanedLine + ' ' + taskIdMatch[0];
+
+                            LogUtils.debug(`Original line: ${newLineText}`);
+                            LogUtils.debug(`Cleaned line: ${cleanedLine}`);
+
+                            // Apply the change
+                            update.view.dispatch({
+                                changes: [{ from: newStartLine.from, to: newStartLine.to, insert: cleanedLine }]
+                            });
+                        }
                     }
                 });
             }
@@ -457,7 +645,8 @@ export class TokenController {
             atomicRanges,
             preventDeletion,
             reminderConverter,
-            taskCreationPlugin
+            taskCreationPlugin,
+            taskCompletionPlugin
         ];
     }
 
@@ -493,54 +682,48 @@ export class TokenController {
                 return '';
             }
 
-            // Find the end of the task header line (before any indented content)
-            let headerEndPos = line.to;
-            let currentLine = line;
-            let nextLinePos = currentLine.to + 1;
-
-            // Look ahead to check for indented content
-            while (nextLinePos < view.state.doc.length) {
-                const nextLine = view.state.doc.lineAt(nextLinePos);
-                if (!nextLine.text.startsWith('    ')) {
-                    break;
-                }
-                currentLine = nextLine;
-                nextLinePos = currentLine.to + 1;
-            }
-
-            const taskContent = taskMatch[1];
-
-            // Create the task ID without extra space
+            // Find the proper position to insert the ID (end of the first line of the task)
             const taskId = `<!-- task-id: ${id} -->`;
 
-            // Initialize metadata for the task BEFORE updating the view
+            // Instead of complex multi-line handling, focus on the main task line
+            // This helps avoid inconsistencies between mobile and desktop
+            let transaction;
+
+            // Get only the first line of the task (ignore indented content for ID placement)
+            // This prevents the ID from ending up in the middle of multi-line content
+            if (Platform.isMobile) {
+                // On mobile, we need a simpler approach to prevent formatting issues
+                const changes = [{
+                    from: line.to,
+                    to: line.to,
+                    insert: ` ${taskId}`
+                }];
+                transaction = view.state.update({ changes });
+            } else {
+                // On desktop, standard approach
+                const changes = [{
+                    from: line.to,
+                    to: line.to,
+                    insert: ` ${taskId}`
+                }];
+                transaction = view.state.update({ changes });
+            }
+
+            view.dispatch(transaction);
+
+            // Store metadata about this task
             this.plugin.settings.taskMetadata[id] = {
-                filePath: file.path,
-                eventId: '',
-                title: taskContent,
-                date: new Date().toISOString().split('T')[0],
-                completed: line.text.includes('[x]') || line.text.includes('[X]'),
+                createdAt: now,
                 lastModified: now,
                 lastSynced: now,
-                createdAt: now
+                eventId: '', // Will be filled when synced with Google Calendar
+                title: line.text.replace(/^\s*- \[[ xX]\] /, ''),
+                date: new Date().toISOString().split('T')[0],
+                completed: line.text.indexOf('- [x]') >= 0 || line.text.indexOf('- [X]') >= 0,
             };
-
-            // Save settings first
             this.plugin.saveSettings();
 
-            // Use setTimeout to defer the view update to the next event cycle
-            // This prevents "update during update" errors
-            setTimeout(() => {
-                try {
-                    const transaction = view.state.update({
-                        changes: { from: headerEndPos, insert: taskId }
-                    });
-                    view.dispatch(transaction);
-                    LogUtils.debug(`Successfully added ID: ${id} to task: ${taskContent}`);
-                } catch (error) {
-                    LogUtils.error(`Failed to dispatch task ID update: ${error}`);
-                }
-            }, 0);
+            LogUtils.debug(`Generated new task ID: ${id}`);
 
             return id;
         } catch (error) {

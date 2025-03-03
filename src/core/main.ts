@@ -1,4 +1,4 @@
-import { Plugin, Notice, Menu, MenuItem, Editor, TFile, TAbstractFile, MarkdownView, Modal, App, Platform } from 'obsidian';
+import { Plugin, Notice, Menu, MenuItem, Editor, TFile, TAbstractFile, MarkdownView, Modal, App } from 'obsidian';
 import { GoogleAuthManager } from '../calendar/googleAuth';
 import { TaskParser } from '../tasks/taskParser';
 import { CalendarSync } from '../calendar/calendarSync';
@@ -16,6 +16,7 @@ import * as dotenv from 'dotenv';
 // Removed UUID dependency for mobile compatibility
 import { LogUtils } from '../utils/logUtils';
 import { initializeStore } from './store';
+import { Platform } from 'obsidian';
 
 // Welcome Modal for first-time users
 class WelcomeModal extends Modal {
@@ -113,40 +114,13 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
     private statusBarItem: HTMLElement | null = null;
     private ribbonIcon: HTMLElement | null = null;
     private unsubscribeStore: (() => void) | undefined = undefined;
-    private lastContent: Record<string, string> = {};
+    private lastContent: string[] = [];
     private cleanupInterval: number | null = null;
-
-    // Flag to track mobile auth state in memory (not persisted)
     public mobileAuthInitiated: boolean = false;
 
     async onload() {
         try {
             console.log('Loading Google Calendar Sync plugin...');
-
-            // Mobile-specific initialization and safety measures
-            if (Platform.isMobile) {
-                // Initialize global state registry for protocol handler safety
-                (window as any).__GCAL_SYNC_STATE = {
-                    disableProtocolHandlers: true, // Default: block all protocol handlers
-                    debugInfo: {
-                        version: this.manifest.version,
-                        loadTime: Date.now(),
-                        platform: 'Mobile'
-                    }
-                };
-
-                // Override protocol handler registration with safety wrapper
-                this.setupSafeProtocolHandling();
-
-                // Perform startup cleanup to prevent unwanted redirects
-                this.performMobileStartupCleanup();
-
-                // Schedule staggered follow-up cleanups for extra safety
-                this.scheduleFollowupCleanups();
-            }
-
-            // Reset mobile auth flag on startup
-            this.mobileAuthInitiated = false;
 
             // Load settings first
             await this.loadSettings();
@@ -168,14 +142,39 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
             // Initialize auth manager and await token loading
             this.authManager = new GoogleAuthManager(this);
 
-            // IMPORTANT: Log diagnostic info for debugging
-            if (Platform.isMobile) {
-                await this.authManager.logOAuthState('onload - after AuthManager init');
-            }
-
             // Make sure any previous protocol handlers are cleaned up first
             await this.authManager.cleanup();
-            await new Promise(resolve => setTimeout(resolve, 5000)); // Mobile auth cooldown
+
+            // Register protocol handler for mobile OAuth
+            this.registerObsidianProtocolHandler('auth/gcalsync', async (params) => {
+                if (this.authManager) {
+                    try {
+                        console.log('Received protocol callback with parameters:', params);
+                        await this.authManager.handleProtocolCallback(params);
+
+                        // Successfully authenticated, show success message
+                        console.log('🔐 Successfully completed authentication via protocol handler');
+                        new Notice('Successfully connected to Google Calendar!');
+
+                        // Set authentication state before initializing calendar sync
+                        useStore.getState().setAuthenticated(true);
+
+                        // Also update the UI status immediately to reflect authenticated state
+                        useStore.getState().setStatus('connected');
+                        this.updateRibbonStatus('connected');
+
+                        // Initialize calendar sync after authentication is complete
+                        await this.initializeCalendarSync();
+                    } catch (error) {
+                        console.error('Error handling protocol callback:', error);
+                        // Show a specific error notice that gives clearer instruction
+                        new Notice('Authentication failed. Please try connecting again.');
+                        // Update UI state
+                        useStore.getState().setStatus('disconnected');
+                        useStore.getState().setAuthenticated(false);
+                    }
+                }
+            });
 
             try {
                 await this.authManager.loadSavedTokens();
@@ -186,7 +185,25 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
                     await this.saveSettings();
                 }
             }
-            const isAuthenticated = this.authManager.isAuthenticated();
+
+            // Check if tokens are actually valid by proper verification
+            let isAuthenticated = this.authManager.isAuthenticated();
+
+            // On mobile especially, we need to verify tokens are actually valid
+            if (isAuthenticated && Platform.isMobile) {
+                console.log('Performing additional token validation on mobile');
+                try {
+                    // This will try to refresh if needed
+                    await this.authManager.getValidAccessToken();
+                } catch (e) {
+                    console.error('Token validation failed on mobile, clearing auth state:', e);
+                    isAuthenticated = false;
+                    if (this.settings.oauth2Tokens) {
+                        this.settings.oauth2Tokens = undefined;
+                        await this.saveSettings();
+                    }
+                }
+            }
 
             // Initialize metadata manager
             this.metadataManager = new MetadataManager(this);
@@ -235,27 +252,6 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
             // Register event handlers
             this.registerEventHandlers();
 
-            // Register file deletion and rename handlers
-            this.registerEvent(
-                this.app.vault.on('delete', (file: TAbstractFile) => {
-                    if (file instanceof TFile && file.path in this.lastContent) {
-                        delete this.lastContent[file.path];
-                    }
-                })
-            );
-
-            this.registerEvent(
-                this.app.vault.on('rename', (file: TAbstractFile, oldPath: string) => {
-                    if (file instanceof TFile) {
-                        if (oldPath in this.lastContent) {
-                            // Move the content to the new path
-                            this.lastContent[file.path] = this.lastContent[oldPath];
-                            delete this.lastContent[oldPath];
-                        }
-                    }
-                })
-            );
-
             // Start periodic cleanup
             this.startPeriodicCleanup();
 
@@ -276,39 +272,15 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
                                 // Force a fresh read of the file content
                                 const content = await state.getFileContent(file.path);
 
-                                // Get the previous content from our cache
-                                const previousContent = this.lastContent[file.path] || "";
+                                // Find all task lines in the file
+                                const lines = content.split('\n');
+                                const taskLines = lines.filter(line => this.taskParser.isTaskLine(line));
 
-                                // Update the cache with current content
-                                this.lastContent[file.path] = content;
+                                if (taskLines.length === 0) return;
 
-                                // If this is the first time we're seeing this file, don't process it
-                                if (!previousContent) return;
-
-                                // Find lines that were modified
-                                const currentLines = content.split('\n');
-                                const previousLines = previousContent.split('\n');
-
-                                // Find modified task lines
-                                const modifiedTaskLines: string[] = [];
-
-                                // Compare line by line to find changes
-                                const maxLines = Math.max(currentLines.length, previousLines.length);
-                                for (let i = 0; i < maxLines; i++) {
-                                    const currentLine = currentLines[i] || "";
-                                    const previousLine = previousLines[i] || "";
-
-                                    // If the line changed and is a task line, add it to our list
-                                    if (currentLine !== previousLine && this.taskParser.isTaskLine(currentLine)) {
-                                        modifiedTaskLines.push(currentLine);
-                                    }
-                                }
-
-                                if (modifiedTaskLines.length === 0) return;
-
-                                // Parse tasks from modified task lines only
+                                // Parse tasks from task lines only
                                 const tasks = [];
-                                for (const line of modifiedTaskLines) {
+                                for (const line of taskLines) {
                                     const task = await this.taskParser.parseTask(line, file.path);
                                     if (task && task.id) {
                                         tasks.push(task);
@@ -345,95 +317,6 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
         }
     }
 
-    /**
-     * Sets up safe protocol handler registration for mobile
-     * Prevents unauthorized protocol handler registration
-     */
-    private setupSafeProtocolHandling(): void {
-        const originalRegisterMethod = this.registerObsidianProtocolHandler;
-        this.registerObsidianProtocolHandler = function (protocol: string, handler: (params: any) => any): void {
-            console.log(`🔒 Protocol handler registration attempt: ${protocol}`);
-
-            // Only allow registration during explicit auth flow
-            if ((window as any).__GCAL_SYNC_STATE?.disableProtocolHandlers || !this.mobileAuthInitiated) {
-                console.log(`🛑 BLOCKED: Protocol handler for ${protocol}`);
-
-                // Store handler for potential later use
-                (window as any).__GCAL_SYNC_STATE.pendingHandler = {
-                    protocol,
-                    handler,
-                    timestamp: Date.now()
-                };
-                return;
-            }
-
-            // Legitimate auth flow, proceed with registration
-            console.log(`✅ ALLOWED: Protocol handler for ${protocol}`);
-            originalRegisterMethod.call(this, protocol, handler);
-        }.bind(this);
-    }
-
-    /**
-     * Performs critical startup cleanup for mobile
-     * Prevents unwanted redirects on app startup
-     */
-    private performMobileStartupCleanup(): void {
-        // Check if current URL is a legitimate auth callback
-        const currentUrl = window.location.href;
-        const isAuthCallback = currentUrl.includes('gcalsync') && currentUrl.includes('code=');
-
-        if (!isAuthCallback) {
-            // Force unregister any existing protocol handler
-            try {
-                this.app.unregisterProtocolHandler?.('auth/gcalsync');
-                console.log('🔥 Unregistered protocol handler on startup');
-            } catch (e) {
-                console.log('Protocol handler cleanup error:', e);
-            }
-
-            // Clear all auth-related localStorage items
-            const keysToRemove = [
-                'gcal_auth_interrupted',
-                'gcal_auth_url',
-                'gcal_auth_in_progress',
-                'gcal_pending_auth',
-                'gcal_redirect_url',
-                'gcal_handler_registered',
-                'gcal_auth_state',
-                'gcal_auth_code_verifier'
-            ];
-
-            keysToRemove.forEach(key => localStorage.removeItem(key));
-
-            // Set version info for debugging
-            localStorage.setItem('gcal_plugin_version', this.manifest.version);
-            localStorage.setItem('gcal_safe_start_time', Date.now().toString());
-            localStorage.setItem('gcal_plugin_version_antiloop', '1.1.0');
-
-            console.log('🔥 Cleared auth state on startup');
-        } else {
-            console.log('✅ Auth callback detected, preserving state');
-            localStorage.setItem('gcal_plugin_version', this.manifest.version);
-        }
-    }
-
-    /**
-     * Schedules staggered follow-up cleanups for extra safety
-     */
-    private scheduleFollowupCleanups(): void {
-        // Schedule multiple cleanups at staggered intervals
-        [50, 150, 250].forEach(delay => {
-            setTimeout(() => {
-                try {
-                    this.app.unregisterProtocolHandler?.('auth/gcalsync');
-                    console.log(`Follow-up cleanup at ${delay}ms`);
-                } catch (e) {
-                    // Silently ignore errors in scheduled cleanup
-                }
-            }, delay);
-        });
-    }
-
     public showWelcomeModal() {
         new WelcomeModal(this.app, this).open();
     }
@@ -467,39 +350,15 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
                         state.invalidateFileCache(file.path);
                         const content = await state.getFileContent(file.path);
 
-                        // Get the previous content from our cache
-                        const previousContent = this.lastContent[file.path] || "";
+                        // Find all task lines in the file
+                        const lines = content.split('\n');
+                        const taskLines = lines.filter(line => this.taskParser.isTaskLine(line));
 
-                        // Update the cache with current content
-                        this.lastContent[file.path] = content;
+                        if (taskLines.length === 0) return;
 
-                        // If this is the first time we're seeing this file, don't process it
-                        if (!previousContent) return;
-
-                        // Find lines that were modified
-                        const currentLines = content.split('\n');
-                        const previousLines = previousContent.split('\n');
-
-                        // Find modified task lines
-                        const modifiedTaskLines: string[] = [];
-
-                        // Compare line by line to find changes
-                        const maxLines = Math.max(currentLines.length, previousLines.length);
-                        for (let i = 0; i < maxLines; i++) {
-                            const currentLine = currentLines[i] || "";
-                            const previousLine = previousLines[i] || "";
-
-                            // If the line changed and is a task line, add it to our list
-                            if (currentLine !== previousLine && this.taskParser.isTaskLine(currentLine)) {
-                                modifiedTaskLines.push(currentLine);
-                            }
-                        }
-
-                        if (modifiedTaskLines.length === 0) return;
-
-                        // Parse tasks from modified task lines only
+                        // Parse tasks from task lines only
                         const tasks = [];
-                        for (const line of modifiedTaskLines) {
+                        for (const line of taskLines) {
                             const task = await this.taskParser.parseTask(line, file.path);
                             if (task && task.id) {
                                 tasks.push(task);
@@ -718,6 +577,14 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
         if (!this.authManager) return;
 
         try {
+            // Verify authentication before proceeding, skip prompt if we're coming from protocol handler
+            const isAuthenticatedFromHandler = useStore.getState().authenticated;
+            if (!await this.verifyAuthentication(isAuthenticatedFromHandler)) {
+                useStore.getState().setStatus('disconnected');
+                console.log('Authentication verification failed, not initializing calendar sync');
+                return;
+            }
+
             this.calendarSync = new CalendarSync(this);
             await this.calendarSync.initialize();
 
@@ -732,6 +599,22 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
         } catch (error) {
             LogUtils.error('Failed to initialize calendar sync:', error);
             useStore.getState().setStatus('error', error as Error);
+
+            // Check if this is an auth error and handle appropriately
+            if (error instanceof Error &&
+                (error.message.includes('Authentication') ||
+                    error.message.includes('auth') ||
+                    error.message.includes('401'))) {
+                console.log('Auth-related error detected, marking as disconnected');
+                useStore.getState().setStatus('disconnected');
+                useStore.getState().setAuthenticated(false);
+
+                // Clear invalid tokens on auth errors
+                if (this.settings.oauth2Tokens) {
+                    this.settings.oauth2Tokens = undefined;
+                    await this.saveSettings();
+                }
+            }
         }
     }
 
@@ -798,17 +681,6 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
         // Run cleanup every 5 minutes
         this.cleanupInterval = window.setInterval(() => {
             useStore.getState().clearStaleProcessingTasks();
-
-            // Clean up lastContent cache for files that haven't been accessed in a while
-            // Get all markdown files in the vault
-            const allFiles = new Set(this.app.vault.getMarkdownFiles().map(file => file.path));
-
-            // Remove entries for files that no longer exist
-            Object.keys(this.lastContent).forEach(path => {
-                if (!allFiles.has(path)) {
-                    delete this.lastContent[path];
-                }
-            });
         }, 5 * 60 * 1000);
     }
 
@@ -898,58 +770,6 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
                 await this.authManager.cleanup();
             }
 
-            // Explicitly unregister protocol handlers when unloading - critical on mobile
-            try {
-                if (Platform.isMobile) {
-                    // Thorough protocol handler cleanup on unload
-                    try {
-                        this.app.unregisterProtocolHandler?.('auth/gcalsync');
-                        console.log('Explicitly unregistered auth/gcalsync handler on plugin unload');
-                    } catch (e) {
-                        console.log('Error unregistering protocol handler:', e);
-                    }
-
-                    // Clean up after a short delay to ensure it completes even during plugin unload
-                    setTimeout(() => {
-                        try {
-                            this.app.unregisterProtocolHandler?.('auth/gcalsync');
-                            console.log('Second cleanup of auth/gcalsync handler on unload');
-                        } catch (e) {
-                            // Silent error - just a backup attempt
-                        }
-                    }, 50);
-
-                    // Clear all auth state from localStorage to prevent redirects on next app open
-                    localStorage.removeItem('gcal_auth_interrupted');
-                    localStorage.removeItem('gcal_auth_url');
-                    localStorage.removeItem('gcal_auth_in_progress');
-                    localStorage.removeItem('gcal_auth_flow_id');
-                    localStorage.removeItem('gcal_auth_flow_started_at');
-                    localStorage.removeItem('gcal_auth_started_intentionally');
-                    localStorage.removeItem('gcal_auth_flow_last_active');
-                    localStorage.removeItem('gcal_handler_registered');
-                    localStorage.removeItem('gcal_auth_state');
-                    localStorage.removeItem('gcal_auth_code_verifier');
-
-                    // Don't remove version marker - keep it for debugging
-                    // But update a flag to know we did a clean shutdown
-                    localStorage.setItem('gcal_clean_shutdown', Date.now().toString());
-
-                    console.log('Cleared all auth-related localStorage items on unload');
-
-                    // Set a SPECIAL flag that will be checked on next startup to prevent any immediate auth
-                    localStorage.setItem('gcal_prevent_next_startup_auth', 'true');
-
-                    // Final desperate attempt to prevent any redirects on next app open
-                    (window as any).__GCAL_DISABLE_PROTOCOL_HANDLERS = true;
-                }
-            } catch (e) {
-                console.log('Error during protocol handler cleanup:', e);
-            }
-
-            // Clear the lastContent cache
-            this.lastContent = {};
-
             // Clear references
             this.calendarSync = null;
             this.authManager = null;
@@ -970,81 +790,17 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
     }
 
     private initializeRibbonIcon() {
-        // Create the main ribbon icon
-        this.ribbonIcon = this.addRibbonIcon('calendar-clock', `Google Calendar Sync v${this.manifest.version}`, (e: MouseEvent) => {
-            if (!this.authManager?.isAuthenticated()) {
+        return this.addRibbonIcon('calendar-clock', 'Google Calendar Sync', (e: MouseEvent) => {
+            // Check both the authManager and the store state
+            const storeAuthenticated = useStore.getState().authenticated;
+            const authManagerAuthenticated = this.authManager?.isAuthenticated() || false;
+
+            if (!storeAuthenticated && !authManagerAuthenticated) {
                 this.authManager?.authorize();
             } else {
                 this.showSyncMenu(e);
             }
         });
-
-        // Also add a version indicator for debugging mobile issues
-        if (Platform.isMobile) {
-            this.addRibbonIcon('info', `GCal Version: ${this.manifest.version}`, () => {
-                new Notice(`Plugin version: ${this.manifest.version}\nRuntime: ${Platform.isDesktop ? 'Desktop' : 'Mobile'}`);
-            });
-
-            // Add debugging button for OAuth flow issues
-            this.addRibbonIcon('bug', 'Debug OAuth', async () => {
-                const debugInfo = this.authManager?.dumpOAuthDebugInfo() || 'Auth manager not initialized';
-
-                // Create a more detailed debug message
-                const debugDetails = {
-                    pluginVersion: this.manifest.version,
-                    platform: Platform.isDesktop ? 'Desktop' : 'Mobile',
-                    authenticated: this.authManager?.isAuthenticated() || false,
-                    protocolHandlerInterception: !!(window as any).__GCAL_SYNC_STATE,
-                    protocolHandlersDisabled: (window as any).__GCAL_SYNC_STATE?.disableProtocolHandlers || false,
-                    pendingHandler: !!(window as any).__GCAL_SYNC_STATE?.pendingHandler,
-                    mobileAuthInitiated: this.mobileAuthInitiated
-                };
-
-                new Notice('Debug info copied to clipboard. Check console for details.');
-                console.log('🐞 OAuth Debug Information:');
-                console.log(JSON.stringify(debugDetails, null, 2));
-                console.log('Full OAuth State:');
-                console.log(debugInfo);
-
-                // Add a copy to clipboard option
-                await navigator.clipboard.writeText(JSON.stringify({
-                    debugDetails,
-                    fullState: JSON.parse(debugInfo)
-                }, null, 2)).catch(() => {
-                    console.log('Could not copy to clipboard');
-                });
-
-                // Force reset the protocol handlers if there are issues
-                if (Platform.isMobile) {
-                    const resetHandlers = window.confirm('Reset protocol handlers? This can help fix redirect issues.');
-                    if (resetHandlers) {
-                        // Total reset of protocol handler state
-                        if ((window as any).__GCAL_SYNC_STATE) {
-                            (window as any).__GCAL_SYNC_STATE.disableProtocolHandlers = true;
-                            (window as any).__GCAL_SYNC_STATE.pendingHandler = null;
-                        }
-
-                        try {
-                            this.app.unregisterProtocolHandler?.('auth/gcalsync');
-                            localStorage.removeItem('gcal_auth_interrupted');
-                            localStorage.removeItem('gcal_auth_url');
-                            localStorage.removeItem('gcal_auth_in_progress');
-                            localStorage.removeItem('gcal_auth_flow_id');
-                            localStorage.removeItem('gcal_auth_flow_started_at');
-                            localStorage.removeItem('gcal_auth_started_intentionally');
-                            localStorage.removeItem('gcal_auth_explicit_start_timestamp');
-
-                            new Notice('Protocol handlers reset. Try restarting Obsidian.');
-                        } catch (e) {
-                            console.error('Error resetting protocol handlers:', e);
-                            new Notice('Error resetting protocol handlers. See console for details.');
-                        }
-                    }
-                }
-            });
-        }
-
-        return this.ribbonIcon;
     }
 
     private updateRibbonStatus(status: TaskStore['status']): void {
@@ -1263,9 +1019,10 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
             }
 
             this.calendarSync = null;
-            const { setStatus, setAuthenticated } = useStore.getState();
+            const { setStatus, setAuthenticated, setSyncEnabled } = useStore.getState();
             setStatus('disconnected');
             setAuthenticated(false);
+            setSyncEnabled(false); // Ensure sync is disabled when disconnected
             new Notice('Disconnected from Google Calendar');
 
             // Show option to reconnect
@@ -1296,51 +1053,62 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
      * Checks if the current token is valid or renews it if needed.
      * @returns true if the token is valid or was successfully renewed
      */
-    public async verifyAuthentication(): Promise<boolean> {
-        try {
-            if (!this.authManager) {
-                LogUtils.error('Auth manager not initialized');
-                return false;
-            }
-
-            // Check if we're authenticated
-            if (!this.authManager.isAuthenticated()) {
-                LogUtils.debug('Not authenticated, redirecting to auth flow');
-                const reconnect = window.confirm('Google Calendar Sync requires authentication. Connect now?');
-                if (reconnect) {
-                    await this.authManager.authorize();
-                } else {
-                    LogUtils.info('User declined to authenticate');
-                }
-                return false;
-            }
-
-            // Check token validity
-            try {
-                // Try to get a valid token, which will refresh if needed
-                await this.authManager.getValidAccessToken();
-            } catch (error) {
-                LogUtils.error('Failed to refresh token', error);
-                // Clear bad tokens
-                if (this.settings.oauth2Tokens) {
-                    this.settings.oauth2Tokens = undefined;
-                    await this.saveSettings();
-                }
-                useStore.getState().setStatus('disconnected');
-
-                // Prompt to re-authenticate
-                const reconnect = window.confirm('Your Google authentication has expired. Reconnect now?');
-                if (reconnect) {
-                    await this.authManager.authorize();
-                }
-                return false;
-            }
-
+    private async verifyAuthentication(skipPrompt = false): Promise<boolean> {
+        // First check the store state - if we were just authenticated via protocol handler
+        if (useStore.getState().authenticated) {
+            console.log('Already authenticated according to store state');
             return true;
-        } catch (error) {
-            LogUtils.error('Error verifying authentication:', error);
-            useStore.getState().setStatus('error', error as Error);
+        }
+
+        // If we're already authenticated, return true
+        if (this.authManager && this.authManager.isAuthenticated()) {
+            try {
+                // Perform a token verification test
+                await this.authManager.getValidAccessToken();
+                return true;
+            } catch (error) {
+                console.log('Token verification failed:', error);
+                // Token might be invalid, proceed to authentication flow
+            }
+        }
+
+        // If skipPrompt is true, we're coming from the protocol handler or other authenticated source
+        if (skipPrompt) {
             return false;
         }
+
+        // Ask user if they want to connect
+        const confirmConnection = await this.showConfirmationDialog(
+            'Connect to Google Calendar',
+            'You need to connect to Google Calendar to sync tasks. Connect now?',
+            'Connect',
+            'Cancel'
+        );
+
+        if (confirmConnection) {
+            console.log('🔍 Not authenticated, redirecting to auth flow');
+            if (this.authManager) {
+                await this.authManager.authorize();
+                // Auth flow will handle initializing calendar sync if successful
+                return true;
+            }
+            return false;
+        } else {
+            console.log('ℹ️ User declined to authenticate');
+            return false;
+        }
+    }
+
+    // Helper method to show a confirmation dialog
+    private async showConfirmationDialog(
+        title: string,
+        message: string,
+        confirmText: string,
+        cancelText: string
+    ): Promise<boolean> {
+        return new Promise((resolve) => {
+            const confirm = window.confirm(message);
+            resolve(confirm);
+        });
     }
 }    

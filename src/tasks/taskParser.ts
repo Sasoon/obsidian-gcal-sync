@@ -76,6 +76,10 @@ export class TaskParser {
             const lines = content.split('\n');
             let lineNumber = 0;
 
+            // Define batch size - smaller on mobile for better performance
+            const BATCH_SIZE = Platform.isMobile ? 25 : 100;
+            const taskBatch: Task[] = [];
+
             while (lineNumber < lines.length) {
                 const line = lines[lineNumber];
                 if (this.isTaskLine(line)) {
@@ -115,7 +119,18 @@ export class TaskParser {
                         if (task) {
                             // Ensure task has the ID from the header
                             task.id = taskId;
-                            tasks.push(task);
+                            taskBatch.push(task);
+
+                            // Process tasks in batches to avoid memory issues with large files
+                            if (taskBatch.length >= BATCH_SIZE) {
+                                tasks.push(...taskBatch);
+                                taskBatch.length = 0; // Clear the batch array
+
+                                // Add a small delay on mobile to prevent UI freezing
+                                if (Platform.isMobile) {
+                                    await new Promise(resolve => setTimeout(resolve, 5));
+                                }
+                            }
                         }
 
                         // Update line number to continue from last processed line
@@ -125,6 +140,11 @@ export class TaskParser {
                     }
                 }
                 lineNumber++;
+            }
+
+            // Add any remaining tasks from the last batch
+            if (taskBatch.length > 0) {
+                tasks.push(...taskBatch);
             }
 
             return tasks;
@@ -140,15 +160,32 @@ export class TaskParser {
 
     public async parseTask(line: string, filePath?: string): Promise<Task | null> {
         try {
+            // Quick check for completed tasks without required date format
+            // This avoids expensive processing for tasks that will ultimately be rejected
+            if (this.isTaskCompleted(line) && !line.includes('📅')) {
+                // Only log in verbose mode
+                if (this.plugin.settings.verboseLogging) {
+                    LogUtils.debug('Skipping completed task without date format');
+                }
+                return null;
+            }
+
             const taskData = this.parseTaskData(line);
+            // Silently skip invalid tasks without logging
             if (!taskData || !this.isValidTaskData(taskData)) {
-                LogUtils.debug('Invalid task data:', taskData);
+                // Only log in verbose mode
+                if (this.plugin.settings.verboseLogging) {
+                    LogUtils.debug('Invalid task data:', taskData);
+                }
                 return null;
             }
 
             const title = this.cleanTaskTitle(line);
             if (!title) {
-                LogUtils.debug('Empty task title');
+                // Only log in verbose mode
+                if (this.plugin.settings.verboseLogging) {
+                    LogUtils.debug('Empty task title');
+                }
                 return null;
             }
 
@@ -158,7 +195,9 @@ export class TaskParser {
 
             // Get existing metadata if available
             const metadata = id ? this.plugin.settings.taskMetadata[id] : null;
-            LogUtils.debug(`Found metadata for task: ${id}`, metadata);
+            if (this.plugin.settings.verboseLogging) {
+                LogUtils.debug(`Found metadata for task: ${id}`, metadata);
+            }
 
             const task: Task = {
                 id,
@@ -179,11 +218,36 @@ export class TaskParser {
                 if (hasChanged) {
                     LogUtils.debug(`Task has changed: ${id}`, task);
 
-                    // Ensure we're not locked before updating
-                    if (!state.isTaskLocked(id)) {
+                    // Simple lock check with timeout to prevent permanent locks
+                    // If the task has been in the processing state for more than 30 seconds,
+                    // assume the lock is stale and proceed anyway
+                    const isLocked = state.isTaskLocked(id);
+                    const lockTimeout = 30000; // 30 seconds
+
+                    // Use a fallback mechanism to detect stale locks
+                    let shouldProcess = !isLocked;
+
+                    // Check if this is a potentially stale lock
+                    if (isLocked) {
+                        // We don't have a direct way to check lock time, so we'll use metadata
+                        const currentTime = Date.now();
+                        const lastModified = metadata.lastModified || 0;
+                        const timeSinceLastUpdate = currentTime - lastModified;
+
+                        // If it's been more than 30 seconds since the last update,
+                        // the lock is likely stale
+                        if (timeSinceLastUpdate > lockTimeout) {
+                            LogUtils.debug(`Potential stale lock detected for task ${id} (${timeSinceLastUpdate}ms since update)`);
+                            shouldProcess = true;
+                        }
+                    }
+
+                    if (shouldProcess) {
                         try {
                             state.addProcessingTask(id);
-                            this.plugin.settings.taskMetadata[id] = {
+
+                            // Update the metadata with the new task data
+                            const updatedMetadata = {
                                 ...metadata,
                                 title: task.title,
                                 date: task.date,
@@ -195,14 +259,20 @@ export class TaskParser {
                                 lastModified: Date.now(),
                                 filePath: filePath || metadata.filePath
                             };
+
+                            // Update metadata in settings
+                            this.plugin.settings.taskMetadata[id] = updatedMetadata;
                             await this.plugin.saveSettings();
 
-                            // Enqueue task for sync
+                            // Ensure task is properly enqueued for sync
                             if (state.isSyncAllowed()) {
+                                LogUtils.debug(`Enqueueing changed task ${id} for sync`);
                                 await state.enqueueTasks([task]);
                             }
+                        } catch (error) {
+                            LogUtils.error(`Error updating task ${id}: ${error}`);
                         } finally {
-                            useStore.getState().removeProcessingTask(id);
+                            state.removeProcessingTask(id);
                         }
                     } else {
                         LogUtils.debug(`Task ${id} is locked, skipping metadata update`);
@@ -288,7 +358,19 @@ export class TaskParser {
     private hasTaskChanged(task: Task, metadata: TaskMetadata): boolean {
         if (!metadata) return true;
 
-        return task.title !== metadata.title ||
+        // Compare trimmed values to detect true changes
+        const taskTitle = task.title?.trim() || '';
+        const metadataTitle = metadata.title?.trim() || '';
+
+        // First do a direct comparison
+        const titleChanged = taskTitle !== metadataTitle;
+
+        // Log the difference if titles don't match
+        if (titleChanged && this.plugin.settings.verboseLogging) {
+            LogUtils.debug(`Title changed: "${metadataTitle}" → "${taskTitle}"`);
+        }
+
+        return titleChanged ||
             task.date !== metadata.date ||
             task.time !== metadata.time ||
             task.endTime !== metadata.endTime ||
@@ -341,12 +423,37 @@ export class TaskParser {
             const files = this.getFilteredFiles();
             LogUtils.debug(`Processing ${files.length} files for tasks`);
 
-            for (const file of files) {
-                try {
-                    const fileTasks = await this.parseTasksFromFile(file);
-                    tasks.push(...fileTasks);
-                } catch (error) {
-                    LogUtils.error(`Failed to parse tasks from file ${file.path}: ${error}`);
+            // Process files in batches on mobile for better performance
+            const MOBILE_BATCH_SIZE = 10; // Process 10 files at a time on mobile
+
+            if (Platform.isMobile) {
+                // Process files in smaller batches on mobile
+                for (let i = 0; i < files.length; i += MOBILE_BATCH_SIZE) {
+                    const fileBatch = files.slice(i, i + MOBILE_BATCH_SIZE);
+
+                    for (const file of fileBatch) {
+                        try {
+                            const fileTasks = await this.parseTasksFromFile(file);
+                            tasks.push(...fileTasks);
+                        } catch (error) {
+                            LogUtils.error(`Failed to parse tasks from file ${file.path}: ${error}`);
+                        }
+                    }
+
+                    // Add a small delay between batches on mobile to prevent UI freezing
+                    if (i + MOBILE_BATCH_SIZE < files.length) {
+                        await new Promise(resolve => setTimeout(resolve, 10));
+                    }
+                }
+            } else {
+                // Process all files at once on desktop
+                for (const file of files) {
+                    try {
+                        const fileTasks = await this.parseTasksFromFile(file);
+                        tasks.push(...fileTasks);
+                    } catch (error) {
+                        LogUtils.error(`Failed to parse tasks from file ${file.path}: ${error}`);
+                    }
                 }
             }
 
@@ -370,14 +477,22 @@ export class TaskParser {
         const lines = line.split('\n');
         let header = lines[0];
 
-        header = header.replace(/^- \[[x ]\] /, '');  // Remove checkbox
-        header = header.replace(this.DATE_PATTERN, '');  // Remove date
-        header = header.replace(this.TIME_PATTERN, '');  // Remove time
-        header = header.replace(this.END_TIME_PATTERN, '');  // Remove end time
-        header = header.replace(this.REMINDER_PATTERN, '');  // Remove reminder
-        header = header.replace(/✅ \d{4}-\d{2}-\d{2}/, '');  // Remove completion date
-        header = header.replace(/<!-- task-id: [a-z0-9]+ -->/, '');  // Remove task ID
-        header = header.trim();
+        // Remove checkbox with proper spacing handling
+        header = header.replace(/^- \[[xX ]\]\s*/, '');
+
+        // Process date, time, and other markers with consistent spacing
+        // This helps prevent data corruption and ensures consistent format
+        header = header.replace(this.DATE_PATTERN, '').trim();
+        header = header.replace(this.TIME_PATTERN, '').trim();
+        header = header.replace(this.END_TIME_PATTERN, '').trim();
+        header = header.replace(this.REMINDER_PATTERN, '').trim();
+        header = header.replace(/✅ \d{4}-\d{2}-\d{2}/, '').trim();
+
+        // Remove the ID with better spacing handling
+        header = header.replace(/<!--\s*task-id:\s*[a-z0-9]+\s*-->/, '').trim();
+
+        // Clean up any double spaces that might have been created
+        header = header.replace(/\s{2,}/g, ' ').trim();
 
         // If there are additional lines, append them
         if (lines.length > 1) {
@@ -388,19 +503,60 @@ export class TaskParser {
     }
 
     private parseTaskData(line: string): { date?: string, time?: string, endTime?: string, reminder?: number } {
-        LogUtils.debug(`Parsing task data from line: ${line}`);
-        const dateMatch = line.match(this.DATE_PATTERN);
-        const timeMatch = line.match(this.TIME_PATTERN);
-        const endTimeMatch = line.match(this.END_TIME_PATTERN);
-        const reminderMatch = line.match(this.REMINDER_PATTERN);
+        // Only log if verbose logging is enabled
+        if (this.plugin.settings.verboseLogging) {
+            LogUtils.debug(`Parsing task data from line: ${line}`);
+        }
 
-        const result = {
-            date: dateMatch?.[1],
-            time: timeMatch?.[1]?.padStart(5, '0'),
-            endTime: endTimeMatch?.[1]?.padStart(5, '0'),
-            reminder: this.parseReminder(reminderMatch)
-        };
-        LogUtils.debug('Parsed task data:', result);
+        // Combined pattern for more efficient parsing
+        // This matches all task components in a single regex pass
+        const combinedPattern = /📅 (\d{4}-\d{2}-\d{2})(?:.*?⏰ (\d{1,2}:\d{2}))?(?:.*?➡️ (\d{1,2}:\d{2}))?(?:.*?🔔\s*(\d+)([mhd]))?/;
+        const match = line.match(combinedPattern);
+
+        let result: { date?: string, time?: string, endTime?: string, reminder?: number };
+
+        if (match) {
+            // Extract values from the combined match
+            const [_, date, time, endTime, reminderValue, reminderUnit] = match;
+
+            // Parse reminder if present
+            let reminder: number | undefined = undefined;
+            if (reminderValue && reminderUnit) {
+                const numValue = parseInt(reminderValue);
+                switch (reminderUnit) {
+                    case 'h': reminder = numValue * 60; break;
+                    case 'd': reminder = numValue * 24 * 60; break;
+                    default: reminder = numValue; break;
+                }
+            }
+
+            result = {
+                date,
+                time: time?.padStart(5, '0'),
+                endTime: endTime?.padStart(5, '0'),
+                reminder
+            };
+        } else {
+            // Fall back to individual patterns if combined pattern fails
+            // This ensures backward compatibility with existing tasks
+            const dateMatch = line.match(this.DATE_PATTERN);
+            const timeMatch = line.match(this.TIME_PATTERN);
+            const endTimeMatch = line.match(this.END_TIME_PATTERN);
+            const reminderMatch = line.match(this.REMINDER_PATTERN);
+
+            result = {
+                date: dateMatch?.[1],
+                time: timeMatch?.[1]?.padStart(5, '0'),
+                endTime: endTimeMatch?.[1]?.padStart(5, '0'),
+                reminder: this.parseReminder(reminderMatch)
+            };
+        }
+
+        // Only log if verbose logging is enabled
+        if (this.plugin.settings.verboseLogging) {
+            LogUtils.debug('Parsed task data:', result);
+        }
+
         return result;
     }
 
@@ -534,5 +690,76 @@ export class TaskParser {
         }
 
         return null;
+    }
+
+    /**
+     * Parse tasks from file content without needing to read the file again
+     * @param content File content as string
+     * @param filePath Path to the file (for reference)
+     * @returns Array of parsed tasks
+     */
+    public async parseTasksFromContent(content: string, filePath: string): Promise<Task[]> {
+        const tasks: Task[] = [];
+        const lines = content.split('\n');
+        let currentTaskLine = '';
+        let inMultilineTask = false;
+
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+
+            // Check if this is a new task line
+            if (this.isTaskLine(line)) {
+                // If we were in a multiline task, parse the previous task
+                if (inMultilineTask) {
+                    const task = await this.parseTask(currentTaskLine, filePath);
+                    if (task) {
+                        tasks.push(task);
+                    }
+                }
+
+                // Start a new task
+                currentTaskLine = line;
+                inMultilineTask = true;
+
+                // Look ahead for indented continuation lines
+                let j = i + 1;
+                while (j < lines.length && lines[j].startsWith('    ')) {
+                    // For mobile compatibility, ensure all task IDs stay on the main task line
+                    // Move any IDs found in indented lines to the main task line
+                    const idMatch = lines[j].match(this.ID_PATTERN);
+                    if (idMatch) {
+                        // Remove the ID from the indented line
+                        lines[j] = lines[j].replace(this.ID_PATTERN, '').trim();
+
+                        // If the main task line doesn't already have this ID, add it
+                        if (!currentTaskLine.includes(idMatch[0])) {
+                            // If the task line already has an ID, log but don't add another
+                            if (currentTaskLine.match(this.ID_PATTERN)) {
+                                LogUtils.debug(`Task already has an ID, skipping additional ID: ${idMatch[0]}`);
+                            } else {
+                                currentTaskLine += ' ' + idMatch[0];
+                            }
+                        }
+                    }
+
+                    // Add the indented line (without IDs) to the current task
+                    currentTaskLine += '\n' + lines[j];
+                    j++;
+                }
+
+                // Skip ahead if we processed indented lines
+                i = j - 1;
+            }
+        }
+
+        // Parse the last task if there was one
+        if (inMultilineTask) {
+            const task = await this.parseTask(currentTaskLine, filePath);
+            if (task) {
+                tasks.push(task);
+            }
+        }
+
+        return tasks;
     }
 }

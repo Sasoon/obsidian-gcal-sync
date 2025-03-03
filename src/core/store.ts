@@ -69,12 +69,15 @@ export interface TaskStore {
     syncTimeout: number | null;
     processingBatch: boolean;
     lastProcessTime: number;
+    syncQueueCheckerId: number | null;
+    syncQueueCheckerTimeout: number | null;
 
     // Sync Queue Actions
     enqueueTasks: (tasks: Task[]) => Promise<void>;
     processSyncQueue: () => Promise<void>;
     processSyncQueueNow: () => Promise<void>;
     clearSyncTimeout: () => void;
+    clearSyncQueueCheckers: () => void;
 
     // Actions
     setState: (newState: Partial<TaskStore>) => void;
@@ -283,6 +286,8 @@ export const store = createStore<TaskStore>()(
                 syncTimeout: null,
                 processingBatch: false,
                 lastProcessTime: 0,
+                syncQueueCheckerId: null,
+                syncQueueCheckerTimeout: null,
 
                 // Sync Queue Actions
                 enqueueTasks: async (tasks: Task[]) => {
@@ -297,22 +302,49 @@ export const store = createStore<TaskStore>()(
                         return;
                     }
 
-                    // Add valid tasks to queue
+                    // Add valid tasks to queue - with deduplication
                     const validTaskIds = [];
+                    const newTasksAdded = [];
+
                     set(state => {
                         tasks.forEach(task => {
                             if (task && task.id) {
-                                // Log detailed task information to help with debugging
-                                LogUtils.debug(`Enqueueing task ${task.id} with title='${task.title}', reminder=${task.reminder}`);
-                                state.syncQueue.add(task.id);
-                                validTaskIds.push(task.id);
+                                // Skip if this task is already being processed to prevent duplicate handling
+                                if (state.processingTasks.has(task.id)) {
+                                    LogUtils.debug(`Task ${task.id} is already being processed, skipping duplicate enqueue`);
+                                    return;
+                                }
+
+                                // Pre-check if task has actually changed to avoid unnecessary queue entries
+                                const metadata = state.plugin.settings.taskMetadata?.[task.id];
+                                const hasChanged = state.hasTaskChanged(task, metadata);
+
+                                if (!hasChanged) {
+                                    LogUtils.debug(`Task ${task.id} has not changed, skipping enqueue`);
+                                    return;
+                                }
+
+                                // Only add the task if it's not already in the queue
+                                if (!state.syncQueue.has(task.id)) {
+                                    // Log detailed task information to help with debugging
+                                    LogUtils.debug(`Enqueueing task ${task.id} with title='${task.title}', reminder=${task.reminder}`);
+                                    state.syncQueue.add(task.id);
+                                    validTaskIds.push(task.id);
+                                    newTasksAdded.push(task.id);
+                                } else {
+                                    LogUtils.debug(`Task ${task.id} already in queue, skipping duplicate`);
+                                    validTaskIds.push(task.id); // Still count as valid for logging
+                                }
                             }
                         });
                     });
 
-                    // Log task count
-                    if (validTaskIds.length > 0) {
-                        LogUtils.debug(`Added ${validTaskIds.length} tasks to sync queue`);
+                    // Log task count - only if we actually added new tasks
+                    if (newTasksAdded.length > 0) {
+                        LogUtils.debug(`Added ${newTasksAdded.length} new tasks to sync queue (total: ${validTaskIds.length})`);
+                    } else if (validTaskIds.length > 0) {
+                        LogUtils.debug(`No new tasks added, ${validTaskIds.length} already in queue`);
+                        return; // No new tasks to process, exit early
                     } else {
                         return; // No valid tasks to process
                     }
@@ -323,47 +355,70 @@ export const store = createStore<TaskStore>()(
                         clearTimeout(currentState.syncTimeout);
                     }
 
-                    // Calculate delay - adaptive based on queue size and sync state
+                    // Calculate delay with improved debouncing
+                    const now = Date.now();
+                    const timeSinceLastProcess = now - currentState.lastProcessTime;
                     const queueSize = currentState.syncQueue.size;
                     const baseDelay = currentState.syncConfig.batchDelay;
 
-                    // If sync is already in progress, use a longer delay to allow current processing to finish
-                    const additionalDelay = currentState.syncInProgress ? 400 : 0;
+                    // Enhanced debounce logic:
+                    // 1. If we recently processed (< 1s ago), use longer delay
+                    // 2. If sync is in progress, use even longer delay
+                    // 3. Scale delay with queue size but with a reasonable cap
+                    const recentProcessDelay = timeSinceLastProcess < 1000 ? 500 : 0;
+                    const syncInProgressDelay = currentState.syncInProgress ? 800 : 0;
 
                     const delay = Math.min(
-                        baseDelay + Math.floor(baseDelay * Math.log(queueSize || 1)) + additionalDelay,
-                        1200 // Increased max cap to 1.2 seconds to allow for more complete processing
+                        baseDelay +
+                        Math.floor(baseDelay * Math.log(queueSize || 1) * 0.5) + // Reduced scaling factor
+                        recentProcessDelay +
+                        syncInProgressDelay,
+                        1500 // Reasonable maximum delay cap
                     );
 
                     // Set new timeout for processing
                     set(state => {
                         state.syncTimeout = window.setTimeout(async () => {
-                            const currentState = get();
-                            if (!currentState.syncInProgress) {
-                                LogUtils.debug(`Processing sync queue with ${currentState.syncQueue.size} tasks`);
-                                await currentState.processSyncQueue();
+                            const latestState = get();
+                            set(state => { state.lastProcessTime = Date.now(); });
+
+                            if (!latestState.syncInProgress) {
+                                LogUtils.debug(`Processing sync queue with ${latestState.syncQueue.size} tasks`);
+                                await latestState.processSyncQueue();
                             } else {
                                 LogUtils.debug('Sync already in progress, tasks will be processed when current sync completes');
 
                                 // Set a checker to process the queue once current sync finishes
-                                // This helps ensure that queued tasks don't get forgotten if the sync
-                                // completes before our next scheduled check
+                                // Use a single interval ID stored in state to prevent multiple intervals
+                                if (latestState.syncQueueCheckerId) {
+                                    clearInterval(latestState.syncQueueCheckerId);
+                                }
+
                                 const intervalId = window.setInterval(() => {
-                                    const latestState = get();
-                                    if (!latestState.syncInProgress && latestState.syncQueue.size > 0) {
+                                    const currentState = get();
+                                    if (!currentState.syncInProgress && currentState.syncQueue.size > 0) {
                                         LogUtils.debug('Previous sync completed, processing pending tasks in queue');
-                                        latestState.processSyncQueue();
+                                        currentState.processSyncQueue();
                                         clearInterval(intervalId);
-                                    } else if (latestState.syncQueue.size === 0) {
+                                        set(state => { state.syncQueueCheckerId = null; });
+                                    } else if (currentState.syncQueue.size === 0) {
                                         // No tasks left in queue, clear interval
                                         clearInterval(intervalId);
+                                        set(state => { state.syncQueueCheckerId = null; });
                                     }
-                                }, 500); // Check every 500ms
+                                }, 500);
 
-                                // Safety cleanup after 10 seconds to avoid lingering intervals
-                                window.setTimeout(() => {
-                                    clearInterval(intervalId);
-                                }, 10000);
+                                set(state => {
+                                    state.syncQueueCheckerId = intervalId as unknown as number;
+
+                                    // Safety cleanup after 10 seconds to avoid lingering intervals
+                                    state.syncQueueCheckerTimeout = window.setTimeout(() => {
+                                        if (state.syncQueueCheckerId) {
+                                            clearInterval(state.syncQueueCheckerId);
+                                            state.syncQueueCheckerId = null;
+                                        }
+                                    }, 10000) as unknown as number;
+                                });
                             }
                         }, delay) as unknown as number;
                     });
@@ -436,112 +491,152 @@ export const store = createStore<TaskStore>()(
                             });
                         }
 
-                        // Get fresh task data for all queued tasks
+                        // Get fresh task data for all queued tasks - WITH OPTIMIZATION
                         const taskData = new Map();
                         const taskIds = Array.from(state.syncQueue);
+                        const filesToProcess = new Set<string>();
 
-                        // Process in batches for better performance
-                        const batchSize = state.syncConfig.batchSize;
-                        for (let i = 0; i < taskIds.length; i += batchSize) {
-                            const batch = taskIds.slice(i, i + batchSize);
+                        // First, gather all files that contain tasks we need to process
+                        // This optimizes the file reading process to minimize redundancy
+                        for (const taskId of taskIds) {
+                            // Try to get file path from metadata
+                            const metadata = state.plugin.settings.taskMetadata[taskId];
+                            if (metadata && metadata.filePath) {
+                                filesToProcess.add(metadata.filePath);
+                            }
+                        }
 
-                            // Get fresh task data for each batch in parallel
-                            const taskPromises = batch.map(async taskId => {
+                        // Process tasks file by file to reduce repeated file reads
+                        if (filesToProcess.size > 0) {
+                            // Use the Obsidian file cache for faster access
+                            for (const filePath of filesToProcess) {
                                 try {
-                                    if (state.plugin.taskParser) {
-                                        const task = await state.plugin.taskParser.getTaskById(taskId);
-                                        if (task) {
-                                            taskData.set(taskId, task);
+                                    // Get file content with caching
+                                    const fileContent = await state.getFileContent(filePath);
+                                    if (!fileContent) continue;
+
+                                    // Parse tasks from this file in one go
+                                    const fileTasks = await state.plugin.taskParser.parseTasksFromContent(fileContent, filePath);
+
+                                    // Match tasks to our task IDs
+                                    for (const task of fileTasks) {
+                                        if (task.id && taskIds.includes(task.id)) {
+                                            taskData.set(task.id, task);
                                         }
+                                    }
+                                } catch (error) {
+                                    LogUtils.error(`Failed to process file ${filePath}:`, error);
+                                }
+                            }
+                        }
+
+                        // For any remaining tasks not found in files, try to get them individually
+                        for (const taskId of taskIds) {
+                            if (!taskData.has(taskId)) {
+                                try {
+                                    const task = await state.plugin.taskParser.getTaskById(taskId);
+                                    if (task) {
+                                        taskData.set(taskId, task);
+                                    } else {
+                                        LogUtils.debug(`Task ${taskId} not found in any file`);
                                     }
                                 } catch (error) {
                                     LogUtils.error(`Failed to get task ${taskId}:`, error);
                                 }
-                            });
-
-                            await Promise.all(taskPromises);
-                        }
-
-                        // Process tasks in batches using fresh task data
-                        const taskBatches: string[][] = [];
-                        let currentBatch: string[] = [];
-
-                        for (const taskId of taskData.keys()) {
-                            currentBatch.push(taskId);
-                            if (currentBatch.length >= 10) {
-                                taskBatches.push([...currentBatch]);
-                                currentBatch = [];
                             }
                         }
 
+                        // Process in batches for better performance
+                        const batchSize = state.syncConfig.batchSize;
+                        const taskBatches = [];
+
+                        // Group tasks into batches - with optimized batching logic
+                        let currentBatch = [];
+
+                        // Group tasks by similarity to optimize API calls
+                        // First, handle all tasks for the same date together
+                        const tasksByDate = new Map<string, Task[]>();
+
+                        for (const [taskId, task] of taskData.entries()) {
+                            if (!task.date) continue;
+                            if (!tasksByDate.has(task.date)) {
+                                tasksByDate.set(task.date, []);
+                            }
+                            tasksByDate.get(task.date)!.push(task);
+                        }
+
+                        // Create batches based on date grouping first
+                        for (const [date, dateTasks] of tasksByDate.entries()) {
+                            for (const task of dateTasks) {
+                                currentBatch.push(task);
+                                if (currentBatch.length >= batchSize) {
+                                    taskBatches.push([...currentBatch]);
+                                    currentBatch = [];
+                                }
+                            }
+                        }
+
+                        // Add any tasks that didn't have dates
+                        for (const [taskId, task] of taskData.entries()) {
+                            if (!task.date && !currentBatch.some(t => t.id === task.id)) {
+                                currentBatch.push(task);
+                                if (currentBatch.length >= batchSize) {
+                                    taskBatches.push([...currentBatch]);
+                                    currentBatch = [];
+                                }
+                            }
+                        }
+
+                        // Add any remaining tasks
                         if (currentBatch.length > 0) {
                             taskBatches.push(currentBatch);
                         }
 
-                        // Process each batch with fresh task data
+                        // Process batches
                         for (const batch of taskBatches) {
                             try {
-                                // Add a longer pause before processing to allow any rapid edits to complete
-                                // Increased from 100ms to 300ms to better capture changes
-                                await new Promise(resolve => setTimeout(resolve, 300));
+                                set(state => {
+                                    state.processingBatch = true;
+                                });
 
-                                // Refresh task data again right before processing batch
-                                const taskVersions = new Map();
-                                for (const taskId of batch) {
+                                // Process each task in the batch
+                                for (const task of batch) {
+                                    if (!task || !task.id) continue;
+
+                                    // Skip tasks that are already being processed
+                                    if (state.processingTasks.has(task.id)) {
+                                        LogUtils.debug(`Task ${task.id} is already being processed in another operation, skipping`);
+                                        continue;
+                                    }
+
+                                    // Double-check if the task has actually changed before syncing
+                                    const metadata = state.plugin.settings.taskMetadata[task.id];
+                                    const hasChanged = state.plugin.calendarSync?.hasTaskChanged(task, metadata);
+
+                                    if (!hasChanged) {
+                                        LogUtils.debug(`Task ${task.id} has not changed, skipping sync`);
+                                        continue;
+                                    }
+
                                     try {
-                                        if (state.plugin.taskParser) {
-                                            const freshTask = await state.plugin.taskParser.getTaskById(taskId);
-                                            if (freshTask) {
-                                                // Store previous version for comparison
-                                                const previousTask = taskData.get(taskId);
-                                                if (previousTask) {
-                                                    taskVersions.set(taskId, {
-                                                        before: {
-                                                            title: previousTask.title,
-                                                            reminder: previousTask.reminder
-                                                        },
-                                                        after: {
-                                                            title: freshTask.title,
-                                                            reminder: freshTask.reminder
-                                                        }
-                                                    });
-                                                }
+                                        // Log what we're processing
+                                        LogUtils.debug(`Processing task ${task.id}: ${JSON.stringify({
+                                            title: task.title,
+                                            date: task.date,
+                                            completed: task.completed
+                                        })}`);
 
-                                                // Update with freshest data
-                                                taskData.set(taskId, freshTask);
-                                            }
-                                        }
+                                        // Process the task
+                                        await state.syncTask(task);
                                     } catch (error) {
-                                        LogUtils.error(`Failed to refresh task ${taskId} before processing:`, error);
+                                        LogUtils.error(`Error processing task ${task.id}:`, error);
+                                    } finally {
+                                        // Remove task from the queue regardless of success/failure
+                                        set(state => {
+                                            state.syncQueue.delete(task.id);
+                                        });
                                     }
                                 }
-
-                                // Log any changes detected during refresh
-                                for (const [taskId, versions] of taskVersions.entries()) {
-                                    const { before, after } = versions;
-                                    if (before.title !== after.title || before.reminder !== after.reminder) {
-                                        LogUtils.debug(`Task ${taskId} changed during batch refresh:
-                                            Before: title='${before.title}', reminder=${before.reminder}
-                                            After: title='${after.title}', reminder=${after.reminder}`);
-                                    }
-                                }
-
-                                await Promise.all(
-                                    batch.map(async taskId => {
-                                        try {
-                                            const task = taskData.get(taskId);
-                                            if (task) {
-                                                LogUtils.debug(`Processing task ${taskId} with reminder=${task.reminder}, title='${task.title}'`);
-                                                await state.plugin.calendarSync?.syncTask(task);
-                                                state.removeFromSyncQueue(taskId);
-                                                state.clearSyncFailure(taskId);
-                                            }
-                                        } catch (error) {
-                                            LogUtils.error(`Failed to sync task ${taskId}:`, error);
-                                            state.recordSyncFailure(taskId, error as Error);
-                                        }
-                                    })
-                                );
 
                                 // Small delay between batches to avoid overwhelming the system
                                 if (batch !== taskBatches[taskBatches.length - 1]) {
@@ -561,6 +656,9 @@ export const store = createStore<TaskStore>()(
                             state.clearFileCache();
                             LogUtils.debug('Mobile: cleared file cache after sync to prevent stale data');
                         }
+
+                        // Clean up any lingering sync checkers
+                        state.clearSyncQueueCheckers();
 
                         set(state => {
                             state.processingBatch = false;
@@ -591,6 +689,9 @@ export const store = createStore<TaskStore>()(
                         set({ syncTimeout: null });
                     }
 
+                    // Clear any queue checkers
+                    state.clearSyncQueueCheckers();
+
                     // Reset sync state to ensure we can start a new sync
                     if (state.syncInProgress) {
                         set({ syncInProgress: false });
@@ -608,6 +709,29 @@ export const store = createStore<TaskStore>()(
                         clearTimeout(state.syncTimeout);
                         set(state => {
                             state.syncTimeout = null;
+                        });
+                    }
+                },
+
+                clearSyncQueueCheckers: () => {
+                    const state = get();
+
+                    // Clear interval checker
+                    if (state.syncQueueCheckerId) {
+                        LogUtils.debug('🔄 Clearing sync queue checker interval');
+                        clearInterval(state.syncQueueCheckerId);
+
+                        set(state => {
+                            state.syncQueueCheckerId = null;
+                        });
+                    }
+
+                    // Clear timeout for the checker
+                    if (state.syncQueueCheckerTimeout) {
+                        clearTimeout(state.syncQueueCheckerTimeout);
+
+                        set(state => {
+                            state.syncQueueCheckerTimeout = null;
                         });
                     }
                 },
@@ -1159,47 +1283,102 @@ export const store = createStore<TaskStore>()(
                         // Lock the task and process it
                         state.addProcessingTask(task.id);
 
-                        // CRITICAL: Enhanced multi-phase task data fetching to prevent stale data issues
-                        let freshTask: Task = task; // Initialize with input task to fix null issue
-                        let secondFreshTask: Task | null = null;
-                        let finalTask: Task | null = null;
+                        // Check if the task is in taskCache and hasn't changed - we can skip processing
+                        const cached = state.taskCache.get(task.id);
+                        if (cached && cached.task) {
+                            // Perform quick equality check of essential fields first
+                            const isTaskUnchanged =
+                                cached.task.title === task.title &&
+                                cached.task.date === task.date &&
+                                cached.task.time === task.time &&
+                                cached.task.endTime === task.endTime &&
+                                cached.task.reminder === task.reminder &&
+                                cached.task.completed === task.completed;
+
+                            if (isTaskUnchanged) {
+                                LogUtils.debug(`Task ${task.id} matches cache exactly, skipping sync`);
+                                state.removeProcessingTask(task.id);
+                                return;
+                            }
+                        }
+
+                        // CRITICAL: Enhanced task data verification but with optimizations
+                        let freshTask: Task = task; // Initialize with input task
+                        let taskChangedDuringProcess = false;
 
                         try {
                             if (state.plugin.taskParser) {
-                                // Phase 1 - get initial fresh data
+                                // Get fresh task data - but only once by default for improved performance
                                 const initialTask = await state.plugin.taskParser.getTaskById(task.id);
+
                                 if (initialTask) {
-                                    freshTask = initialTask;
-                                    LogUtils.debug(`Initial fresh task data for ${task.id}, title='${initialTask.title}', reminder=${initialTask.reminder}`);
+                                    // Compare original task with fresh task
+                                    const originalJson = JSON.stringify({
+                                        title: task.title,
+                                        date: task.date,
+                                        time: task.time,
+                                        endTime: task.endTime,
+                                        reminder: task.reminder,
+                                        completed: task.completed
+                                    });
+
+                                    const freshJson = JSON.stringify({
+                                        title: initialTask.title,
+                                        date: initialTask.date,
+                                        time: initialTask.time,
+                                        endTime: initialTask.endTime,
+                                        reminder: initialTask.reminder,
+                                        completed: initialTask.completed
+                                    });
+
+                                    if (originalJson !== freshJson) {
+                                        // Only log if there's an actual change
+                                        LogUtils.debug(`Task ${task.id} changed during retrieval:
+                                            Original: title='${task.title}', date=${task.date}, time=${task.time}
+                                            Current: title='${initialTask.title}', date=${initialTask.date}, time=${initialTask.time}`);
+
+                                        freshTask = initialTask;
+                                        taskChangedDuringProcess = true;
+                                    } else {
+                                        // No change detected, use original task data
+                                        LogUtils.debug(`Task ${task.id} unchanged during retrieval`);
+                                    }
                                 }
 
-                                // Phase 2 - wait longer (250ms) to allow pending edits to complete
-                                await new Promise(resolve => setTimeout(resolve, 250));
-
-                                // Get second fresh copy of task data
-                                secondFreshTask = await state.plugin.taskParser.getTaskById(task.id);
-                                if (secondFreshTask) {
-                                    // Compare first and second versions
-                                    const firstJson = JSON.stringify(freshTask);
-                                    const secondJson = JSON.stringify(secondFreshTask);
-
-                                    if (firstJson !== secondJson) {
-                                        LogUtils.debug(`Task ${task.id} changed during verification: 
-                                            Before: title='${freshTask.title}', reminder=${freshTask.reminder}
-                                            After: title='${secondFreshTask.title}', reminder=${secondFreshTask.reminder}`);
-                                        freshTask = secondFreshTask;
-                                    }
-
-                                    // Phase 3 - final verification with short pause
+                                // Only do a second check if we detected an initial change
+                                // This reduces unnecessary file reads for stable tasks
+                                if (taskChangedDuringProcess) {
+                                    // Wait briefly (100ms) for potential additional changes
                                     await new Promise(resolve => setTimeout(resolve, 100));
 
-                                    // Final check to catch very recent edits
-                                    finalTask = await state.plugin.taskParser.getTaskById(task.id);
-                                    if (finalTask && JSON.stringify(finalTask) !== JSON.stringify(freshTask)) {
-                                        LogUtils.debug(`Final task verification caught change for ${task.id}:
-                                            Before: title='${freshTask.title}', reminder=${freshTask.reminder}
-                                            After: title='${finalTask.title}', reminder=${finalTask.reminder}`);
-                                        freshTask = finalTask;
+                                    // Perform one final check to catch very recent edits
+                                    const finalTask = await state.plugin.taskParser.getTaskById(task.id);
+                                    if (finalTask) {
+                                        const newFreshJson = JSON.stringify({
+                                            title: finalTask.title,
+                                            date: finalTask.date,
+                                            time: finalTask.time,
+                                            endTime: finalTask.endTime,
+                                            reminder: finalTask.reminder,
+                                            completed: finalTask.completed
+                                        });
+
+                                        const currentFreshJson = JSON.stringify({
+                                            title: freshTask.title,
+                                            date: freshTask.date,
+                                            time: freshTask.time,
+                                            endTime: freshTask.endTime,
+                                            reminder: freshTask.reminder,
+                                            completed: freshTask.completed
+                                        });
+
+                                        if (newFreshJson !== currentFreshJson) {
+                                            LogUtils.debug(`Task ${task.id} changed again during final check:
+                                                Before: title='${freshTask.title}', date=${freshTask.date}
+                                                After: title='${finalTask.title}', date=${finalTask.date}`);
+
+                                            freshTask = finalTask;
+                                        }
                                     }
                                 }
                             }
@@ -1208,9 +1387,6 @@ export const store = createStore<TaskStore>()(
                             LogUtils.debug(`Couldn't get fresh task data for ${task.id}, using provided data`);
                             // freshTask is already initialized with task
                         }
-
-                        // Clear metadata cache to ensure we get the latest
-                        state.clearTaskCache();
 
                         // Get metadata
                         const metadata = state.getTaskMetadata(task.id);
@@ -1224,7 +1400,7 @@ export const store = createStore<TaskStore>()(
                         }
 
                         // Log the actual data we're syncing to help with debugging
-                        LogUtils.debug(`Syncing task ${task.id} with reminder=${freshTask.reminder}, title='${freshTask.title}'`);
+                        LogUtils.debug(`Syncing task ${task.id} with title='${freshTask.title}', date=${freshTask.date}, reminder=${freshTask.reminder}`);
 
                         // Sync the task with calendar
                         await state.plugin.calendarSync?.syncTask(freshTask);
@@ -1232,7 +1408,7 @@ export const store = createStore<TaskStore>()(
                         // Update task version
                         state.updateTaskVersion(task.id, Date.now());
 
-                        // Cache the current state
+                        // Cache the current state - with updated task data
                         const updatedMetadata = state.plugin.settings.taskMetadata[task.id];
                         if (updatedMetadata) {
                             state.cacheTask(task.id, freshTask, updatedMetadata);
@@ -1282,6 +1458,7 @@ interface TaskStoreApi {
     processSyncQueue: () => Promise<void>;
     processSyncQueueNow: () => Promise<void>;
     clearSyncTimeout: () => void;
+    clearSyncQueueCheckers: () => void;
     clearSyncQueue: () => void;
     updateSyncConfig: (config: Partial<TaskStore['syncConfig']>) => void;
     updateRateLimit: (limit: Partial<TaskStore['rateLimit']>) => void;
@@ -1318,6 +1495,7 @@ export const useStore = {
         processSyncQueue: () => store.getState().processSyncQueue(),
         processSyncQueueNow: () => store.getState().processSyncQueueNow(),
         clearSyncTimeout: () => store.getState().clearSyncTimeout(),
+        clearSyncQueueCheckers: () => store.getState().clearSyncQueueCheckers(),
         clearSyncQueue: () => store.getState().clearSyncQueue(),
         updateSyncConfig: (config: Partial<TaskStore['syncConfig']>) => store.getState().updateSyncConfig(config),
         updateRateLimit: (limit: Partial<TaskStore['rateLimit']>) => store.getState().updateRateLimit(limit),
