@@ -7,12 +7,12 @@ import { Notice } from 'obsidian';
 export const DEFAULT_SETTINGS: GoogleCalendarSettings = {
     clientId: '',
     oauth2Tokens: undefined,
-    syncEnabled: false,
+    syncEnabled: true,
     defaultReminder: 30,
-    includeFolders: [],  // Empty by default to scan all folders
+    includeFolders: ['calendar/daily/2025-02-27'],  // Empty by default to scan all folders
     taskMetadata: {},
     taskIds: {},
-    verboseLogging: false,  // Default to false for new users
+    verboseLogging: true,  // Default to false for new users
     hasCompletedOnboarding: true,  // Set to true to prevent welcome modal on startup
     mobileSyncLimit: 100,  // Default to 100 files on mobile
     mobileOptimizations: true,  // Enable mobile optimizations by default

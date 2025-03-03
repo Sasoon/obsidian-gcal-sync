@@ -46,6 +46,10 @@ export interface TaskMetadata {
     createdAt: number;
     lastModified: number;
     lastSynced: number;
+    version?: number;               // Explicit version counter for tracking changes
+    syncOperationId?: string;       // Operation ID for tracing sync operations
+    justSynced?: boolean;           // Flag to prevent double-syncing during rapid edits
+    syncTimestamp?: number;         // When the sync actually occurred
     conflicts?: string[];
     conflictResolution?: {
         timestamp: number;

@@ -15,6 +15,7 @@ import { EditorView } from '@codemirror/view';
 import * as dotenv from 'dotenv';
 // Removed UUID dependency for mobile compatibility
 import { LogUtils } from '../utils/logUtils';
+import { hasTaskChanged } from '../utils/taskUtils';
 import { initializeStore } from './store';
 import { Platform } from 'obsidian';
 
@@ -179,8 +180,8 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
                         // First invalidate the cache
                         state.invalidateFileCache(file.path);
 
-                        // Wait a small amount of time for the file system to settle
-                        await new Promise(resolve => setTimeout(resolve, 50));
+                        // Wait longer for the file system to settle (increased from 50ms to 150ms)
+                        await new Promise(resolve => setTimeout(resolve, 150));
 
                         try {
                             try {
@@ -203,7 +204,31 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
                                 }
 
                                 if (tasks.length > 0) {
-                                    await state.enqueueTasks(tasks);
+                                    // Filter out tasks that were just synced
+                                    const filteredTasks = tasks.filter(task => {
+                                        if (!task.id) return false;
+                                        
+                                        // Skip recently synced tasks
+                                        const metadata = state.plugin.settings.taskMetadata?.[task.id];
+                                        if (metadata?.justSynced && metadata.syncTimestamp) {
+                                            const syncAge = Date.now() - metadata.syncTimestamp;
+                                            if (syncAge < 2000) { // 2 second window
+                                                LogUtils.debug(`Task ${task.id} was just synced ${syncAge}ms ago, skipping (primary handler)`);
+                                                return false;
+                                            }
+                                        }
+                                        
+                                        // Skip locked tasks
+                                        if (state.isTaskLocked(task.id)) {
+                                            return false;
+                                        }
+                                        
+                                        return true;
+                                    });
+                                    
+                                    if (filteredTasks.length > 0) {
+                                        await state.enqueueTasks(filteredTasks);
+                                    }
                                 }
                             } catch (fileError) {
                                 // Safely handle file reading errors
@@ -244,6 +269,10 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
                         // Get the file content
                         const state = useStore.getState();
                         state.invalidateFileCache(file.path);
+                        
+                        // Add a small delay to ensure filesystem has the latest content
+                        await new Promise(resolve => setTimeout(resolve, 100));
+                        
                         const content = await state.getFileContent(file.path);
 
                         // Find all task lines in the file
@@ -263,32 +292,32 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
 
                         if (tasks.length === 0) return;
 
-                        // Batch process tasks
-                        const taskBatch = tasks.map(task => ({
-                            id: task.id,
-                            task,
-                            queued: false
-                        }));
-
-                        // First pass: Queue non-locked tasks
-                        for (const item of taskBatch) {
-                            if (!state.isTaskLocked(item.id)) {
-                                await state.enqueueTasks([item.task]);
-                                item.queued = true;
+                        // Filter out tasks that were just synced
+                        const tasksToQueue = [];
+                        
+                        for (const task of tasks) {
+                            if (!task.id) continue;
+                            
+                            // Check for just synced tasks and skip them
+                            const metadata = state.plugin.settings.taskMetadata?.[task.id];
+                            if (metadata?.justSynced && metadata.syncTimestamp) {
+                                const syncAge = Date.now() - metadata.syncTimestamp;
+                                if (syncAge < 2000) { // Use a longer window (2 seconds)
+                                    LogUtils.debug(`Task ${task.id} was just synced ${syncAge}ms ago, skipping (file handler)`);
+                                    continue;
+                                }
+                            }
+                            
+                            // Only queue if not locked
+                            if (!state.isTaskLocked(task.id)) {
+                                tasksToQueue.push(task);
                             }
                         }
-
-                        // Second pass: Try to queue locked tasks after a short delay
-                        setTimeout(async () => {
-                            const currentState = useStore.getState();
-                            const unqueuedTasks = taskBatch
-                                .filter(item => !item.queued && !currentState.isTaskLocked(item.id))
-                                .map(item => item.task);
-
-                            if (unqueuedTasks.length > 0) {
-                                await currentState.enqueueTasks(unqueuedTasks);
-                            }
-                        }, 1000); // Try again after 1 second for locked tasks
+                        
+                        // Enqueue all tasks at once
+                        if (tasksToQueue.length > 0) {
+                            await state.enqueueTasks(tasksToQueue);
+                        }
                     } catch (error) {
                         LogUtils.error(`Failed to process file changes for ${file.path}:`, error);
                     }
@@ -372,8 +401,12 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
         try {
             // First check if we can read the file
             try {
-                // Force fresh content read
+                // Force fresh content read with better timing
                 await state.invalidateFileCache(file.path);
+                
+                // Add a small delay to ensure filesystem has the latest content
+                await new Promise(resolve => setTimeout(resolve, 100));
+                
                 await state.getFileContent(file.path);
             } catch (fileError) {
                 LogUtils.error(`Failed to read file ${file.path} during editor changes:`, fileError);
@@ -392,48 +425,37 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
                 const task = await this.taskParser.parseTask(currentLine, file.path);
 
                 if (task && task.id) {
-                    const taskBatch = [{
-                        id: task.id,
-                        task,
-                        queued: false
-                    }];
+                    // Get metadata to check if task has changed
+                    const metadata = this.settings.taskMetadata[task.id];
+                    const result = hasTaskChanged(task, metadata, task.id);
+                    const hasChanged = result.changed;
 
-                    // Process non-locked task immediately
-                    if (!state.isTaskLocked(task.id)) {
-                        await state.enqueueTasks([task]);
-                        taskBatch[0].queued = true;
-                    }
-
-                    // Retry locked task
-                    const retryLockedTasks = async () => {
-                        const currentState = useStore.getState();
-                        const unqueuedTasks = taskBatch
-                            .filter(item => !item.queued && !currentState.isTaskLocked(item.id))
-                            .map(item => {
-                                item.queued = true;
-                                return item.task;
-                            });
-
-                        if (unqueuedTasks.length > 0) {
-                            await currentState.enqueueTasks(unqueuedTasks);
-                            return taskBatch.some(item => !item.queued);
-                        }
-                        return false;
-                    };
-
-                    // Retry a few times with exponential backoff
-                    let retryCount = 0;
-                    const maxRetries = 3;
-                    const retryWithBackoff = async () => {
-                        if (await retryLockedTasks()) {
-                            retryCount++;
-                            if (retryCount < maxRetries) {
-                                setTimeout(retryWithBackoff, 500 * Math.pow(2, retryCount));
+                    if (hasChanged) {
+                        // Additional check for recently synced tasks
+                        if (metadata?.justSynced && metadata.syncTimestamp) {
+                            const syncAge = Date.now() - metadata.syncTimestamp;
+                            if (syncAge < 2500) { // Even longer window for editor changes
+                                LogUtils.debug(`Task ${task.id} was just synced ${syncAge}ms ago, skipping editor handler`);
+                                return; // Skip completely
                             }
                         }
-                    };
+                    
+                        LogUtils.debug(`Task ${task.id} has changed, enqueueing for sync`);
 
-                    retryWithBackoff();
+                        // Process non-locked task immediately
+                        if (!state.isTaskLocked(task.id)) {
+                            await state.enqueueTasks([task]);
+
+                            // Trigger immediate sync to process the task
+                            await state.processSyncQueueNow();
+                        } else {
+                            // If task is locked, add to queue for later processing
+                            LogUtils.debug(`Task ${task.id} is locked, adding to sync queue for later processing`);
+                            state.addToSyncQueue(task.id);
+                        }
+                    } else {
+                        LogUtils.debug(`Task ${task.id} has not changed, skipping enqueue`);
+                    }
                 }
             }
         } catch (error) {

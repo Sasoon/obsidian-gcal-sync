@@ -6,6 +6,7 @@ import { useStore } from '../core/store';
 import { LogUtils } from '../utils/logUtils';
 import { ErrorUtils } from '../utils/errorUtils';
 import { TimeUtils } from '../utils/timeUtils';
+import { hasTaskChanged } from '../utils/taskUtils';
 import { Platform } from 'obsidian';
 
 export class TaskId {
@@ -214,7 +215,8 @@ export class TaskParser {
             // Use atomic state access
             const state = useStore.getState();
             if (state.isSyncAllowed() && id && metadata?.eventId) {
-                const hasChanged = this.hasTaskChanged(task, metadata);
+                const result = hasTaskChanged(task, metadata, task.id);
+                const hasChanged = result.changed;
                 if (hasChanged) {
                     LogUtils.debug(`Task has changed: ${id}`, task);
 
@@ -239,6 +241,11 @@ export class TaskParser {
                         if (timeSinceLastUpdate > lockTimeout) {
                             LogUtils.debug(`Potential stale lock detected for task ${id} (${timeSinceLastUpdate}ms since update)`);
                             shouldProcess = true;
+                        } else {
+                            // Don't add to sync queue here - this can cause double-syncing
+                            // The task will be properly synced once the lock is released or expires
+                            LogUtils.debug(`Task ${id} is locked, will be synced after lock is released`);
+                            // No enqueueTasks call to prevent double-sync
                         }
                     }
 
@@ -247,6 +254,15 @@ export class TaskParser {
                             state.addProcessingTask(id);
 
                             // Update the metadata with the new task data
+                            // Get current version and increment it
+                            const currentVersion = metadata.version || 0;
+                            const newVersion = currentVersion + 1;
+                            
+                            // Generate an operation ID for better tracing
+                            const opId = `${id.substring(0, 4)}-${newVersion}-${Math.random().toString(36).substring(2, 5)}`;
+                            
+                            LogUtils.debug(`Updating task metadata for ${id} (op:${opId}) to version ${newVersion}`);
+                            
                             const updatedMetadata = {
                                 ...metadata,
                                 title: task.title,
@@ -257,17 +273,33 @@ export class TaskParser {
                                 completed: task.completed,
                                 completedDate: task.completedDate,
                                 lastModified: Date.now(),
-                                filePath: filePath || metadata.filePath
+                                filePath: filePath || metadata.filePath,
+                                version: newVersion,
+                                syncOperationId: opId
                             };
 
                             // Update metadata in settings
                             this.plugin.settings.taskMetadata[id] = updatedMetadata;
                             await this.plugin.saveSettings();
 
+                            // Create a fresh task object that incorporates the latest changes
+                            // This ensures the task object passed to enqueueTasks reflects the current state
+                            const freshTask: Task = {
+                                ...task,
+                                title: updatedMetadata.title,
+                                date: updatedMetadata.date,
+                                time: updatedMetadata.time,
+                                endTime: updatedMetadata.endTime,
+                                reminder: updatedMetadata.reminder,
+                                completed: updatedMetadata.completed,
+                                completedDate: updatedMetadata.completedDate
+                            };
+
                             // Ensure task is properly enqueued for sync
                             if (state.isSyncAllowed()) {
                                 LogUtils.debug(`Enqueueing changed task ${id} for sync`);
-                                await state.enqueueTasks([task]);
+                                // Pass the freshTask to ensure it contains all changes
+                                await state.enqueueTasks([freshTask]);
                             }
                         } catch (error) {
                             LogUtils.error(`Error updating task ${id}: ${error}`);
@@ -356,31 +388,24 @@ export class TaskParser {
     }
 
     private hasTaskChanged(task: Task, metadata: TaskMetadata): boolean {
-        if (!metadata) return true;
-
-        // Compare trimmed values to detect true changes
-        const taskTitle = task.title?.trim() || '';
-        const metadataTitle = metadata.title?.trim() || '';
-
-        // First do a direct comparison
-        const titleChanged = taskTitle !== metadataTitle;
-
-        // Log the difference if titles don't match
-        if (titleChanged && this.plugin.settings.verboseLogging) {
-            LogUtils.debug(`Title changed: "${metadataTitle}" → "${taskTitle}"`);
+        const result = hasTaskChanged(task, metadata, task.id);
+        
+        // Additional logging for task parser verbose mode
+        if (result.changed && this.plugin.settings.verboseLogging) {
+            if (result.changes?.title) {
+                LogUtils.debug(`Title changed: "${metadata?.title}" → "${task.title}"`);
+            }
         }
-
-        return titleChanged ||
-            task.date !== metadata.date ||
-            task.time !== metadata.time ||
-            task.endTime !== metadata.endTime ||
-            task.reminder !== metadata.reminder ||
-            task.completed !== metadata.completed;
+        
+        return result.changed;
     }
 
     public async createTask(task: Task) {
         try {
-            const taskContent = `${task.title} 📅 ${task.date}` +
+            // Keep the task formatting consistent but don't enforce any specific order of components
+            // This allows the user to see the format but the parser will still work with any order
+            const taskContent = `${task.title}` +
+                (task.date ? ` 📅 ${task.date}` : '') +
                 (task.time ? ` ⏰ ${task.time}` : '') +
                 (task.endTime ? ` ➡️ ${task.endTime}` : '') +
                 (task.reminder ? ` 🔔 ${task.reminder}m` : '');
@@ -482,6 +507,7 @@ export class TaskParser {
 
         // Process date, time, and other markers with consistent spacing
         // This helps prevent data corruption and ensures consistent format
+        // Use a more flexible approach that doesn't care about the order of components
         header = header.replace(this.DATE_PATTERN, '').trim();
         header = header.replace(this.TIME_PATTERN, '').trim();
         header = header.replace(this.END_TIME_PATTERN, '').trim();
@@ -508,7 +534,8 @@ export class TaskParser {
             LogUtils.debug(`Parsing task data from line: ${line}`);
         }
 
-        // Parse each component independently for more flexibility
+        // Parse each component independently for more flexibility,
+        // supporting any order of components in the task line
         const dateMatch = line.match(this.DATE_PATTERN);
         const timeMatch = line.match(this.TIME_PATTERN);
         const endTimeMatch = line.match(this.END_TIME_PATTERN);
@@ -647,13 +674,49 @@ export class TaskParser {
     }
 
     public async getTaskById(taskId: string): Promise<Task | null> {
-        const files = this.getFilteredFiles();
+        // First try using metadata to locate the file directly (more efficient)
+        const metadata = this.plugin.settings.taskMetadata[taskId];
+        if (metadata?.filePath) {
+            try {
+                // Force cache invalidation before reading
+                const state = useStore.getState();
+                state.invalidateFileCache(metadata.filePath);
+                
+                // Add a small delay to ensure filesystem has the latest content
+                await new Promise(resolve => setTimeout(resolve, 50));
+                
+                // Get file by path
+                const file = this.plugin.app.vault.getAbstractFileByPath(metadata.filePath);
+                if (file instanceof TFile) {
+                    // Parse all tasks from this specific file
+                    const tasks = await this.parseTasksFromFile(file);
+                    const task = tasks.find(t => t.id === taskId);
+                    if (task) {
+                        return task;
+                    }
+                }
+            } catch (error) {
+                LogUtils.error(`Failed to get task ${taskId} from known file ${metadata.filePath}:`, error);
+                // Fall back to full search below
+            }
+        }
 
+        // If not found or metadata doesn't have file path, do a full search
+        const files = this.getFilteredFiles();
         for (const file of files) {
-            const tasks = await this.parseTasksFromFile(file);
-            const task = tasks.find(t => t.id === taskId);
-            if (task) {
-                return task;
+            try {
+                // Force cache invalidation for each file
+                const state = useStore.getState();
+                state.invalidateFileCache(file.path);
+                
+                const tasks = await this.parseTasksFromFile(file);
+                const task = tasks.find(t => t.id === taskId);
+                if (task) {
+                    return task;
+                }
+            } catch (error) {
+                LogUtils.error(`Failed to parse tasks from file ${file.path}:`, error);
+                // Continue with next file
             }
         }
 

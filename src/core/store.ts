@@ -5,6 +5,7 @@ import { enableMapSet } from 'immer';
 import type { Draft } from 'immer';
 import type { Task, TaskMetadata } from './types';
 import { LogUtils } from '../utils/logUtils';
+import { hasTaskChanged } from '../utils/taskUtils';
 import type GoogleCalendarSyncPlugin from './main';
 import { TFile, TAbstractFile } from 'obsidian';
 import { Platform } from 'obsidian';
@@ -42,6 +43,7 @@ export interface TaskStore {
     taskVersions: Map<string, number>;
     locks: Set<string>;
     lockTimeouts: Map<string, number>;
+    lockTimestamps: Map<string, number>; // When locks were acquired (for diagnostics)
     lastSyncTime: number | null;
     syncInProgress: boolean;
     syncQueue: Set<string>;
@@ -90,6 +92,7 @@ export interface TaskStore {
     clearStaleProcessingTasks: (timeout?: number) => void;
     reset: () => void;
     isTaskLocked: (taskId: string) => boolean;
+    getLockTimestamp: (taskId: string) => number | undefined;
     isSyncEnabled: () => boolean;
     isSyncAllowed: () => boolean;
     tryLock: (lockKey: string) => boolean;
@@ -205,6 +208,7 @@ type PersistState = {
     processingTasks?: string[];
     locks?: string[];
     lockTimeouts?: [string, number][];
+    lockTimestamps?: [string, number][];
     syncQueue?: string[];
     failedSyncs?: [string, { error: Error; attempts: number }][];
     lastSyncTime?: number;
@@ -227,6 +231,7 @@ const persistConfig: StorePersist = {
         processingTasks: Array.from(state.processingTasks),
         locks: Array.from(state.locks),
         lockTimeouts: Array.from(state.lockTimeouts.entries()),
+        lockTimestamps: Array.from(state.lockTimestamps.entries()),
         syncQueue: Array.from(state.syncQueue),
         failedSyncs: Array.from(state.failedSyncs.entries()),
         lastSyncTime: state.lastSyncTime || undefined
@@ -239,6 +244,7 @@ const persistConfig: StorePersist = {
         processingTasks: new Set(persistedState.processingTasks || []),
         locks: new Set(persistedState.locks || []),
         lockTimeouts: new Map(persistedState.lockTimeouts || []),
+        lockTimestamps: new Map(persistedState.lockTimestamps || []),
         syncQueue: new Set(persistedState.syncQueue || []),
         failedSyncs: new Map(persistedState.failedSyncs || []),
         lastSyncTime: persistedState.lastSyncTime ?? currentState.lastSyncTime
@@ -259,6 +265,7 @@ export const store = createStore<TaskStore>()(
                 taskVersions: new Map(),
                 locks: new Set<string>(),
                 lockTimeouts: new Map(),
+                lockTimestamps: new Map<string, number>(),
                 lastSyncTime: 0,
                 syncInProgress: false,
                 syncQueue: new Set<string>(),
@@ -309,31 +316,57 @@ export const store = createStore<TaskStore>()(
                     set(state => {
                         tasks.forEach(task => {
                             if (task && task.id) {
-                                // Skip if this task is already being processed to prevent duplicate handling
-                                if (state.processingTasks.has(task.id)) {
-                                    LogUtils.debug(`Task ${task.id} is already being processed, skipping duplicate enqueue`);
-                                    return;
+                                // Skip the redundant pre-check for changes - we trust the caller
+                                // The caller has already determined this task needs to be synced
+                                // This helps avoid race conditions where metadata was just updated
+                                
+                                // But log the task state for debugging purposes
+                                const existingMetadata = state.plugin.settings.taskMetadata?.[task.id];
+                                if (state.plugin.settings.verboseLogging) {
+                                    LogUtils.debug(`Enqueueing task ${task.id}:
+                                        Task state: title=${task.title}, date=${task.date}, reminder=${task.reminder}
+                                        Metadata: ${existingMetadata ? 
+                                            `title=${existingMetadata.title}, date=${existingMetadata.date}, reminder=${existingMetadata.reminder}` : 
+                                            'none'}`);
                                 }
 
-                                // Pre-check if task has actually changed to avoid unnecessary queue entries
+                                // Check for specific conditions that would cause us to skip enqueueing
                                 const metadata = state.plugin.settings.taskMetadata?.[task.id];
-                                const hasChanged = state.hasTaskChanged(task, metadata);
-
-                                if (!hasChanged) {
-                                    LogUtils.debug(`Task ${task.id} has not changed, skipping enqueue`);
-                                    return;
+                                
+                                // Skip if the task was just synced (within last 1.5 seconds)
+                                if (metadata?.justSynced && metadata.syncTimestamp) {
+                                    const syncAge = Date.now() - metadata.syncTimestamp;
+                                    if (syncAge < 1500) {
+                                        LogUtils.debug(`Task ${task.id} was just synced ${syncAge}ms ago, skipping redundant enqueue`);
+                                        return;
+                                    }
                                 }
-
-                                // Only add the task if it's not already in the queue
-                                if (!state.syncQueue.has(task.id)) {
-                                    // Log detailed task information to help with debugging
-                                    LogUtils.debug(`Enqueueing task ${task.id} with title='${task.title}', reminder=${task.reminder}`);
+                                
+                                // Check if task is already being processed
+                                if (state.processingTasks.has(task.id)) {
+                                    // Instead of skipping, add to sync queue for later processing
+                                    // This ensures the task will be processed after current operation completes
+                                    LogUtils.debug(`Task ${task.id} is already being processed, adding to sync queue for later processing`);
                                     state.syncQueue.add(task.id);
                                     validTaskIds.push(task.id);
                                     newTasksAdded.push(task.id);
+                                    return;
+                                }
+
+                                // Check if already in queue first (for logging)
+                                const alreadyInQueue = state.syncQueue.has(task.id);
+                                
+                                // Always add to queue - we'll deduplicate later when processing
+                                // This ensures changes made during processing aren't missed
+                                LogUtils.debug(`Enqueueing task ${task.id} with title='${task.title}', reminder=${task.reminder}`);
+                                state.syncQueue.add(task.id);
+                                validTaskIds.push(task.id);
+                                
+                                // Only count as newly added if it wasn't in the queue before
+                                if (!alreadyInQueue) {
+                                    newTasksAdded.push(task.id);
                                 } else {
-                                    LogUtils.debug(`Task ${task.id} already in queue, skipping duplicate`);
-                                    validTaskIds.push(task.id); // Still count as valid for logging
+                                    LogUtils.debug(`Task ${task.id} was already in queue, will be re-processed with latest changes`);
                                 }
                             }
                         });
@@ -449,8 +482,13 @@ export const store = createStore<TaskStore>()(
                         }
                     }
 
-                    if (state.syncQueue.size === 0 || state.processingBatch) {
-                        LogUtils.debug('🔄 Skipping sync: no tasks or batch in progress');
+                    if (state.syncQueue.size === 0) {
+                        LogUtils.debug('🔄 Skipping sync: no tasks in queue');
+                        return;
+                    }
+
+                    if (state.processingBatch) {
+                        LogUtils.debug('🔄 Batch already in progress, will process remaining tasks after completion');
                         return;
                     }
 
@@ -499,38 +537,30 @@ export const store = createStore<TaskStore>()(
                         // First, gather all files that contain tasks we need to process
                         // This optimizes the file reading process to minimize redundancy
                         for (const taskId of taskIds) {
-                            // Try to get file path from metadata
                             const metadata = state.plugin.settings.taskMetadata[taskId];
-                            if (metadata && metadata.filePath) {
+                            if (metadata?.filePath) {
                                 filesToProcess.add(metadata.filePath);
                             }
                         }
 
-                        // Process tasks file by file to reduce repeated file reads
-                        if (filesToProcess.size > 0) {
-                            // Use the Obsidian file cache for faster access
-                            for (const filePath of filesToProcess) {
-                                try {
-                                    // Get file content with caching
-                                    const fileContent = await state.getFileContent(filePath);
-                                    if (!fileContent) continue;
-
-                                    // Parse tasks from this file in one go
-                                    const fileTasks = await state.plugin.taskParser.parseTasksFromContent(fileContent, filePath);
-
-                                    // Match tasks to our task IDs
-                                    for (const task of fileTasks) {
-                                        if (task.id && taskIds.includes(task.id)) {
+                        // Process each file once to get all tasks
+                        for (const filePath of filesToProcess) {
+                            try {
+                                const file = state.plugin.app.vault.getAbstractFileByPath(filePath);
+                                if (file instanceof TFile) {
+                                    const tasks = await state.plugin.taskParser.parseTasksFromFile(file);
+                                    for (const task of tasks) {
+                                        if (task.id && state.syncQueue.has(task.id)) {
                                             taskData.set(task.id, task);
                                         }
                                     }
-                                } catch (error) {
-                                    LogUtils.error(`Failed to process file ${filePath}:`, error);
                                 }
+                            } catch (error) {
+                                LogUtils.error(`Failed to process file ${filePath}:`, error);
                             }
                         }
 
-                        // For any remaining tasks not found in files, try to get them individually
+                        // For any tasks not found in files, try to get them by ID
                         for (const taskId of taskIds) {
                             if (!taskData.has(taskId)) {
                                 try {
@@ -538,7 +568,7 @@ export const store = createStore<TaskStore>()(
                                     if (task) {
                                         taskData.set(taskId, task);
                                     } else {
-                                        LogUtils.debug(`Task ${taskId} not found in any file`);
+                                        LogUtils.warn(`Task ${taskId} not found in any file, will be removed from queue`);
                                     }
                                 } catch (error) {
                                     LogUtils.error(`Failed to get task ${taskId}:`, error);
@@ -546,160 +576,96 @@ export const store = createStore<TaskStore>()(
                             }
                         }
 
-                        // Process in batches for better performance
+                        // Process tasks in batches
                         const batchSize = state.syncConfig.batchSize;
-                        const taskBatches = [];
+                        const tasks = Array.from(taskData.values());
+                        const totalTasks = tasks.length;
 
-                        // Group tasks into batches - with optimized batching logic
-                        let currentBatch = [];
+                        LogUtils.debug(`Found ${totalTasks} tasks to sync`);
 
-                        // Group tasks by similarity to optimize API calls
-                        // First, handle all tasks for the same date together
-                        const tasksByDate = new Map<string, Task[]>();
-
-                        for (const [taskId, task] of taskData.entries()) {
-                            if (!task.date) continue;
-                            if (!tasksByDate.has(task.date)) {
-                                tasksByDate.set(task.date, []);
-                            }
-                            tasksByDate.get(task.date)!.push(task);
-                        }
-
-                        // Create batches based on date grouping first
-                        for (const [date, dateTasks] of tasksByDate.entries()) {
-                            for (const task of dateTasks) {
-                                currentBatch.push(task);
-                                if (currentBatch.length >= batchSize) {
-                                    taskBatches.push([...currentBatch]);
-                                    currentBatch = [];
+                        // Filter out tasks that were just synced to avoid redundant processing
+                        const filteredTasks = tasks.filter(task => {
+                            if (!task.id) return false;
+                            
+                            // Check if task was just synced
+                            const metadata = state.plugin.settings.taskMetadata[task.id];
+                            if (metadata?.justSynced && metadata.syncTimestamp) {
+                                const syncAge = Date.now() - metadata.syncTimestamp;
+                                if (syncAge < 1500) {
+                                    LogUtils.debug(`Skipping task ${task.id} that was just synced ${syncAge}ms ago`);
+                                    // Also remove from queue since we're skipping it
+                                    state.removeFromSyncQueue(task.id);
+                                    return false;
                                 }
                             }
-                        }
+                            return true;
+                        });
+                        
+                        // Process filtered tasks in batches
+                        const actualTaskCount = filteredTasks.length;
+                        LogUtils.debug(`After filtering, processing ${actualTaskCount}/${totalTasks} tasks`);
+                        
+                        for (let i = 0; i < filteredTasks.length; i += batchSize) {
+                            const batch = filteredTasks.slice(i, i + batchSize);
 
-                        // Add any tasks that didn't have dates
-                        for (const [taskId, task] of taskData.entries()) {
-                            if (!task.date && !currentBatch.some(t => t.id === task.id)) {
-                                currentBatch.push(task);
-                                if (currentBatch.length >= batchSize) {
-                                    taskBatches.push([...currentBatch]);
-                                    currentBatch = [];
+                            // Process each task in the batch
+                            const results = await Promise.allSettled(
+                                batch.map(task => state.syncTask(task))
+                            );
+
+                            // Log results
+                            const succeeded = results.filter(r => r.status === 'fulfilled').length;
+                            const failed = results.filter(r => r.status === 'rejected').length;
+
+                            LogUtils.debug(`Batch progress: ${i + batch.length}/${actualTaskCount} (${succeeded} succeeded, ${failed} failed)`);
+
+                            // Remove processed tasks from queue
+                            for (const task of batch) {
+                                if (task.id) {
+                                    state.removeFromSyncQueue(task.id);
                                 }
                             }
-                        }
 
-                        // Add any remaining tasks
-                        if (currentBatch.length > 0) {
-                            taskBatches.push(currentBatch);
-                        }
-
-                        // Process batches
-                        for (const batch of taskBatches) {
-                            try {
-                                set(state => {
-                                    state.processingBatch = true;
-                                });
-
-                                // Process each task in the batch
-                                for (const task of batch) {
-                                    if (!task || !task.id) continue;
-
-                                    // Skip tasks that are already being processed
-                                    if (state.processingTasks.has(task.id)) {
-                                        LogUtils.debug(`Task ${task.id} is already being processed in another operation, skipping`);
-                                        continue;
-                                    }
-
-                                    // Double-check if the task has actually changed before syncing
-                                    const metadata = state.plugin.settings.taskMetadata[task.id];
-                                    const hasChanged = state.plugin.calendarSync?.hasTaskChanged(task, metadata);
-
-                                    if (!hasChanged) {
-                                        LogUtils.debug(`Task ${task.id} has not changed, skipping sync`);
-                                        continue;
-                                    }
-
-                                    try {
-                                        // Log what we're processing
-                                        LogUtils.debug(`Processing task ${task.id}: ${JSON.stringify({
-                                            title: task.title,
-                                            date: task.date,
-                                            completed: task.completed
-                                        })}`);
-
-                                        // Process the task
-                                        await state.syncTask(task);
-                                    } catch (error) {
-                                        LogUtils.error(`Error processing task ${task.id}:`, error);
-                                    } finally {
-                                        // Remove task from the queue regardless of success/failure
-                                        set(state => {
-                                            state.syncQueue.delete(task.id);
-                                        });
-                                    }
-                                }
-
-                                // Small delay between batches to avoid overwhelming the system
-                                if (batch !== taskBatches[taskBatches.length - 1]) {
-                                    await new Promise(resolve => setTimeout(resolve, state.syncConfig.batchDelay));
-                                }
-                            } catch (error) {
-                                LogUtils.error('Batch processing failed:', error);
+                            // Add delay between batches if configured
+                            if (i + batchSize < tasks.length && state.syncConfig.batchDelay > 0) {
+                                await new Promise(resolve => setTimeout(resolve, state.syncConfig.batchDelay));
                             }
                         }
 
-                        // Cleanup and save
-                        await state.plugin.saveSettings();
-
-                        // On mobile, ensure we refresh file cache after sync
-                        if (Platform.isMobile) {
-                            // Clear any cached file content to ensure we get fresh data on next sync
-                            state.clearFileCache();
-                            LogUtils.debug('Mobile: cleared file cache after sync to prevent stale data');
+                        // Clean up any tasks that weren't found
+                        for (const taskId of taskIds) {
+                            if (!taskData.has(taskId)) {
+                                state.removeFromSyncQueue(taskId);
+                            }
                         }
 
-                        // Clean up any lingering sync checkers
-                        state.clearSyncQueueCheckers();
-
+                        LogUtils.debug('✅ Full sync completed');
+                    } catch (error) {
+                        LogUtils.error('Failed to process sync queue:', error);
+                    } finally {
                         set(state => {
                             state.processingBatch = false;
                             state.syncInProgress = false;
                             state.status = 'connected';
                             state.lastSyncTime = Date.now();
                         });
-
-                        LogUtils.debug(`🔄 Auto sync completed successfully with ${taskData.size} tasks`);
-                    } catch (error) {
-                        LogUtils.error('Auto sync failed:', error);
-                        set(state => {
-                            state.processingBatch = false;
-                            state.syncInProgress = false;
-                            state.status = 'error';
-                            state.error = error as Error;
-                        });
                     }
                 },
 
-                processSyncQueueNow: () => {
+                processSyncQueueNow: async () => {
                     const state = get();
-                    LogUtils.debug('🔄 Manual sync triggered');
 
-                    // Clear any existing timeout
-                    if (state.syncTimeout) {
-                        clearTimeout(state.syncTimeout);
-                        set({ syncTimeout: null });
-                    }
+                    // Clear any pending sync timeouts
+                    state.clearSyncTimeout();
 
-                    // Clear any queue checkers
+                    // Clear any sync queue checkers
                     state.clearSyncQueueCheckers();
 
-                    // Reset sync state to ensure we can start a new sync
-                    if (state.syncInProgress) {
-                        set({ syncInProgress: false });
-                    }
+                    // Process the queue immediately
+                    await state.processSyncQueue();
 
-                    // Start new sync process
-                    LogUtils.debug('🔄 Starting manual sync process');
-                    return state.processSyncQueue();
+                    // Log completion
+                    LogUtils.debug('🔄 Manual sync completed');
                 },
 
                 clearSyncTimeout: () => {
@@ -769,8 +735,13 @@ export const store = createStore<TaskStore>()(
                     set(state => {
                         if (!state.processingTasks.has(taskId)) {
                             state.processingTasks.add(taskId);
-                            state.lockTimeouts.set(taskId, Date.now() + 30000);
-                            LogUtils.debug(`Added processing task ${taskId}`);
+                            // Store both an expiration time and the lock acquisition time
+                            const now = Date.now();
+                            state.lockTimeouts.set(taskId, now + 30000);
+                            // Also store the actual lock timestamp for diagnostics
+                            state.lockTimestamps = state.lockTimestamps || new Map();
+                            state.lockTimestamps.set(taskId, now);
+                            LogUtils.debug(`Added processing task ${taskId} at ${new Date(now).toISOString()}`);
                         }
                     }),
 
@@ -779,7 +750,18 @@ export const store = createStore<TaskStore>()(
                         state.processingTasks.delete(taskId);
                         state.locks.delete(taskId);
                         state.lockTimeouts.delete(taskId);
-                        LogUtils.debug(`Removed processing task ${taskId}`);
+                        // Also clear the lock timestamp if it exists
+                        if (state.lockTimestamps) {
+                            state.lockTimestamps.delete(taskId);
+                        }
+                        // Calculate and log lock duration if possible
+                        if (state.lockTimestamps && state.lockTimestamps.has(taskId)) {
+                            const startTime = state.lockTimestamps.get(taskId) || 0;
+                            const duration = Date.now() - startTime;
+                            LogUtils.debug(`Removed processing task ${taskId} (lock held for ${duration}ms)`);
+                        } else {
+                            LogUtils.debug(`Removed processing task ${taskId}`);
+                        }
                     }),
 
                 updateTaskVersion: (taskId: string, version: number) =>
@@ -796,13 +778,36 @@ export const store = createStore<TaskStore>()(
                 clearStaleProcessingTasks: (timeout: number = 30000) =>
                     set(state => {
                         const now = Date.now();
-                        for (const [lockKey, timeoutValue] of state.lockTimeouts) {
-                            if (now > timeoutValue) {
-                                state.processingTasks.delete(lockKey);
-                                state.locks.delete(lockKey);
-                                state.lockTimeouts.delete(lockKey);
-                                LogUtils.debug(`Released stale lock for ${lockKey}`);
+                        let staleLocksCleared = 0;
+                        
+                        // Collect all locks to check in an array first to avoid mutation during iteration
+                        const locksToCheck = Array.from(state.lockTimeouts.entries());
+                        
+                        // First pass: identify stale locks
+                        const staleKeys = locksToCheck
+                            .filter(([_, timeoutValue]) => now > timeoutValue)
+                            .map(([key]) => key);
+                            
+                        // Log stale lock information with acquisition time if available
+                        for (const lockKey of staleKeys) {
+                            const lockTime = state.lockTimestamps?.get(lockKey);
+                            const lockDuration = lockTime ? (now - lockTime) : 'unknown';
+                            
+                            LogUtils.warn(`Clearing stale lock for ${lockKey} (held for ${lockDuration}ms)`);
+                            
+                            // Remove from all lock-related collections
+                            state.processingTasks.delete(lockKey);
+                            state.locks.delete(lockKey);
+                            state.lockTimeouts.delete(lockKey);
+                            if (state.lockTimestamps) {
+                                state.lockTimestamps.delete(lockKey);
                             }
+                            
+                            staleLocksCleared++;
+                        }
+                        
+                        if (staleLocksCleared > 0) {
+                            LogUtils.debug(`Cleared ${staleLocksCleared} stale locks`);
                         }
                     }),
 
@@ -813,6 +818,11 @@ export const store = createStore<TaskStore>()(
                     }
                     state.lockTimeouts.clear();
                     state.lockAttempts.clear();
+                    
+                    // Clear lock timestamps if they exist
+                    if (state.lockTimestamps) {
+                        state.lockTimestamps.clear();
+                    }
 
                     state.syncEnabled = false;
                     state.authenticated = false;
@@ -831,6 +841,13 @@ export const store = createStore<TaskStore>()(
                 isTaskLocked: (taskId: string) => {
                     const state = get();
                     return state.locks.has(taskId) || state.processingTasks.has(taskId);
+                },
+                
+                getLockTimestamp: (taskId: string) => {
+                    const state = get();
+                    // Safely access the timestamps map which might not exist in older data
+                    if (!state.lockTimestamps) return undefined;
+                    return state.lockTimestamps.get(taskId);
                 },
 
                 isSyncEnabled: () => {
@@ -1192,72 +1209,9 @@ export const store = createStore<TaskStore>()(
                         metadata = state.plugin.settings.taskMetadata[task.id];
                     }
 
-                    // First check cached data
-                    const cached = task.id ? state.taskCache.get(task.id) : null;
-
-                    if (cached && cached.metadata) {
-                        // Thorough comparison of all fields that might change
-                        const hasChanged =
-                            !cached.task ||
-                            cached.task.title !== task.title ||
-                            cached.task.date !== task.date ||
-                            cached.task.time !== task.time ||
-                            cached.task.endTime !== task.endTime ||
-                            cached.task.reminder !== task.reminder ||
-                            cached.task.completed !== task.completed;
-
-                        if (hasChanged) {
-                            // Log specific changes for debugging
-                            const changes = [];
-                            if (cached.task?.title !== task.title) changes.push(`title: '${cached.task?.title}' -> '${task.title}'`);
-                            if (cached.task?.date !== task.date) changes.push(`date: '${cached.task?.date}' -> '${task.date}'`);
-                            if (cached.task?.time !== task.time) changes.push(`time: '${cached.task?.time}' -> '${task.time}'`);
-                            if (cached.task?.endTime !== task.endTime) changes.push(`endTime: '${cached.task?.endTime}' -> '${task.endTime}'`);
-                            if (cached.task?.reminder !== task.reminder) changes.push(`reminder: '${cached.task?.reminder}' -> '${task.reminder}'`);
-                            if (cached.task?.completed !== task.completed) changes.push(`completed: '${cached.task?.completed}' -> '${task.completed}'`);
-
-                            if (changes.length > 0) {
-                                LogUtils.debug(`Task ${task.id} changed: ${changes.join(', ')}`);
-                            }
-
-                            return true;
-                        }
-
-                        return false;
-                    }
-
-                    // If no cached data, compare to metadata
-                    if (metadata) {
-                        const hasMetadataChanged =
-                            metadata.title !== task.title ||
-                            metadata.date !== task.date ||
-                            metadata.time !== task.time ||
-                            metadata.endTime !== task.endTime ||
-                            metadata.reminder !== task.reminder ||
-                            metadata.completed !== task.completed;
-
-                        if (hasMetadataChanged) {
-                            // Log specific changes for debugging
-                            const changes = [];
-                            if (metadata.title !== task.title) changes.push(`title: '${metadata.title}' -> '${task.title}'`);
-                            if (metadata.date !== task.date) changes.push(`date: '${metadata.date}' -> '${task.date}'`);
-                            if (metadata.time !== task.time) changes.push(`time: '${metadata.time}' -> '${task.time}'`);
-                            if (metadata.endTime !== task.endTime) changes.push(`endTime: '${metadata.endTime}' -> '${task.endTime}'`);
-                            if (metadata.reminder !== task.reminder) changes.push(`reminder: '${metadata.reminder}' -> '${task.reminder}'`);
-                            if (metadata.completed !== task.completed) changes.push(`completed: '${metadata.completed}' -> '${task.completed}'`);
-
-                            if (changes.length > 0) {
-                                LogUtils.debug(`Task ${task.id} metadata changed: ${changes.join(', ')}`);
-                            }
-
-                            return true;
-                        }
-
-                        return false;
-                    }
-
-                    // No metadata or cache - treat as changed
-                    return true;
+                    // Use the standardized implementation from taskUtils
+                    const result = hasTaskChanged(task, metadata, task.id);
+                    return result.changed;
                 },
 
                 syncTask: async (task: Task) => {
@@ -1282,25 +1236,6 @@ export const store = createStore<TaskStore>()(
 
                         // Lock the task and process it
                         state.addProcessingTask(task.id);
-
-                        // Check if the task is in taskCache and hasn't changed - we can skip processing
-                        const cached = state.taskCache.get(task.id);
-                        if (cached && cached.task) {
-                            // Perform quick equality check of essential fields first
-                            const isTaskUnchanged =
-                                cached.task.title === task.title &&
-                                cached.task.date === task.date &&
-                                cached.task.time === task.time &&
-                                cached.task.endTime === task.endTime &&
-                                cached.task.reminder === task.reminder &&
-                                cached.task.completed === task.completed;
-
-                            if (isTaskUnchanged) {
-                                LogUtils.debug(`Task ${task.id} matches cache exactly, skipping sync`);
-                                state.removeProcessingTask(task.id);
-                                return;
-                            }
-                        }
 
                         // CRITICAL: Enhanced task data verification but with optimizations
                         let freshTask: Task = task; // Initialize with input task
@@ -1391,12 +1326,14 @@ export const store = createStore<TaskStore>()(
                         // Get metadata
                         const metadata = state.getTaskMetadata(task.id);
 
-                        // Check if task has changed
-                        const hasChanged = state.plugin.calendarSync?.hasTaskChanged(freshTask, metadata);
-                        if (!hasChanged) {
-                            LogUtils.debug(`Task ${task.id} has not changed, skipping sync`);
-                            state.removeProcessingTask(task.id);
-                            return;
+                        // Check if task has changed using shared implementation
+                        const result = hasTaskChanged(freshTask, metadata, task.id);
+                        const hasChanged = result.changed;
+
+                        // Always sync if we're explicitly calling syncTask, even if hasChanged is false
+                        // This ensures tasks are synced when they're manually processed
+                        if (hasChanged === false) {
+                            LogUtils.debug(`Task ${task.id} appears unchanged, but syncing anyway to ensure consistency`);
                         }
 
                         // Log the actual data we're syncing to help with debugging
@@ -1443,6 +1380,7 @@ interface TaskStoreApi {
     clearStaleProcessingTasks: (timeout?: number) => void;
     reset: () => void;
     isTaskLocked: (taskId: string) => boolean;
+    getLockTimestamp: (taskId: string) => number | undefined;
     isSyncEnabled: () => boolean;
     isSyncAllowed: () => boolean;
     tryLock: (lockKey: string) => boolean;
@@ -1480,6 +1418,7 @@ export const useStore = {
         clearStaleProcessingTasks: (timeout?: number) => store.getState().clearStaleProcessingTasks(timeout),
         reset: () => store.getState().reset(),
         isTaskLocked: (taskId: string) => store.getState().isTaskLocked(taskId),
+        getLockTimestamp: (taskId: string) => store.getState().getLockTimestamp(taskId),
         isSyncEnabled: () => store.getState().isSyncEnabled(),
         isSyncAllowed: () => store.getState().isSyncAllowed(),
         tryLock: (lockKey: string) => store.getState().tryLock(lockKey),
