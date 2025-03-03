@@ -115,13 +115,5 @@ export class GoogleCalendarSettingsTab extends PluginSettingTab {
                         await this.plugin.saveSettings();
                     }
                 }));
-
-        // Info Section
-        containerEl.createEl('h3', { text: 'Plugin Information' });
-
-        const infoDiv = containerEl.createDiv({ cls: 'plugin-info' });
-        infoDiv.createEl('p', {
-            text: 'This plugin syncs Obsidian Tasks with Google Calendar. It extends the emoji syntax of Obsidian Tasks to include start time, end time, and reminders.',
-        });
     }
 }

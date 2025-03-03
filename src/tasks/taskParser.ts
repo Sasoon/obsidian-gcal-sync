@@ -508,49 +508,30 @@ export class TaskParser {
             LogUtils.debug(`Parsing task data from line: ${line}`);
         }
 
-        // Combined pattern for more efficient parsing
-        // This matches all task components in a single regex pass
-        const combinedPattern = /📅 (\d{4}-\d{2}-\d{2})(?:.*?⏰ (\d{1,2}:\d{2}))?(?:.*?➡️ (\d{1,2}:\d{2}))?(?:.*?🔔\s*(\d+)([mhd]))?/;
-        const match = line.match(combinedPattern);
+        // Parse each component independently for more flexibility
+        const dateMatch = line.match(this.DATE_PATTERN);
+        const timeMatch = line.match(this.TIME_PATTERN);
+        const endTimeMatch = line.match(this.END_TIME_PATTERN);
+        const reminderMatch = line.match(this.REMINDER_PATTERN);
 
-        let result: { date?: string, time?: string, endTime?: string, reminder?: number };
-
-        if (match) {
-            // Extract values from the combined match
-            const [_, date, time, endTime, reminderValue, reminderUnit] = match;
-
-            // Parse reminder if present
-            let reminder: number | undefined = undefined;
-            if (reminderValue && reminderUnit) {
-                const numValue = parseInt(reminderValue);
-                switch (reminderUnit) {
-                    case 'h': reminder = numValue * 60; break;
-                    case 'd': reminder = numValue * 24 * 60; break;
-                    default: reminder = numValue; break;
-                }
+        // Parse reminder if present
+        let reminder: number | undefined = undefined;
+        if (reminderMatch) {
+            const [_, value, unit] = reminderMatch;
+            const numValue = parseInt(value);
+            switch (unit) {
+                case 'h': reminder = numValue * 60; break;
+                case 'd': reminder = numValue * 24 * 60; break;
+                default: reminder = numValue; break;
             }
-
-            result = {
-                date,
-                time: time?.padStart(5, '0'),
-                endTime: endTime?.padStart(5, '0'),
-                reminder
-            };
-        } else {
-            // Fall back to individual patterns if combined pattern fails
-            // This ensures backward compatibility with existing tasks
-            const dateMatch = line.match(this.DATE_PATTERN);
-            const timeMatch = line.match(this.TIME_PATTERN);
-            const endTimeMatch = line.match(this.END_TIME_PATTERN);
-            const reminderMatch = line.match(this.REMINDER_PATTERN);
-
-            result = {
-                date: dateMatch?.[1],
-                time: timeMatch?.[1]?.padStart(5, '0'),
-                endTime: endTimeMatch?.[1]?.padStart(5, '0'),
-                reminder: this.parseReminder(reminderMatch)
-            };
         }
+
+        const result = {
+            date: dateMatch?.[1],
+            time: timeMatch?.[1]?.padStart(5, '0'),
+            endTime: endTimeMatch?.[1]?.padStart(5, '0'),
+            reminder
+        };
 
         // Only log if verbose logging is enabled
         if (this.plugin.settings.verboseLogging) {
@@ -558,19 +539,6 @@ export class TaskParser {
         }
 
         return result;
-    }
-
-    private parseReminder(match: RegExpMatchArray | null): number | undefined {
-        if (!match) return undefined;
-
-        const [_, value, unit] = match;
-        const numValue = parseInt(value);
-
-        switch (unit) {
-            case 'h': return numValue * 60;
-            case 'd': return numValue * 24 * 60;
-            default: return numValue;
-        }
     }
 
     public async mergeTaskChanges(base: Task, local: Task, remote: Task): Promise<Task> {
