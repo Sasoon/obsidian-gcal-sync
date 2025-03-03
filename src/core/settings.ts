@@ -12,7 +12,7 @@ export const DEFAULT_SETTINGS: GoogleCalendarSettings = {
     includeFolders: [],  // Empty by default to scan all folders
     taskMetadata: {},
     taskIds: {},
-    verboseLogging: true,  // Default to false for new users
+    verboseLogging: false,  // Default to false for new users
     hasCompletedOnboarding: true,  // Set to true to prevent welcome modal on startup
     mobileSyncLimit: 100,  // Default to 100 files on mobile
     mobileOptimizations: true,  // Enable mobile optimizations by default
@@ -116,27 +116,6 @@ export class GoogleCalendarSettingsTab extends PluginSettingTab {
                     }
                 }));
 
-        // Help & Onboarding Section
-        containerEl.createEl('h3', { text: 'Help & Onboarding' });
-
-        new Setting(containerEl)
-            .setName('Create Sample Task')
-            .setDesc('Insert a sample task into the current note to help you get started')
-            .addButton(button => button
-                .setButtonText('Insert Sample Task')
-                .onClick(() => {
-                    this.plugin.insertSampleTask();
-                }));
-
-        new Setting(containerEl)
-            .setName('Show Welcome Screen')
-            .setDesc('Show the welcome screen with setup instructions again')
-            .addButton(button => button
-                .setButtonText('Show Welcome Screen')
-                .onClick(() => {
-                    this.plugin.showWelcomeModal();
-                }));
-
         // Info Section
         containerEl.createEl('h3', { text: 'Plugin Information' });
 
@@ -144,18 +123,5 @@ export class GoogleCalendarSettingsTab extends PluginSettingTab {
         infoDiv.createEl('p', {
             text: 'This plugin syncs Obsidian Tasks with Google Calendar. It extends the emoji syntax of Obsidian Tasks to include start time, end time, and reminders.',
         });
-
-        const syntaxDiv = containerEl.createDiv({ cls: 'syntax-info' });
-        syntaxDiv.createEl('h4', { text: 'Task Syntax' });
-        syntaxDiv.createEl('p', { text: 'Example task with all options:' });
-        syntaxDiv.createEl('code', {
-            text: '- [ ] My task 📅 2024-01-01 ⏰ 10:00 ➡️ 11:00 🔔 15m',
-        });
-        syntaxDiv.createEl('p', { text: 'Where:' });
-        const ul = syntaxDiv.createEl('ul');
-        ul.createEl('li', { text: '📅 sets the date (YYYY-MM-DD)' });
-        ul.createEl('li', { text: '⏰ sets the start time (HH:MM)' });
-        ul.createEl('li', { text: '➡️ sets the end time (HH:MM)' });
-        ul.createEl('li', { text: '🔔 sets the reminder (number + m/h/d for minutes/hours/days)' });
     }
 }

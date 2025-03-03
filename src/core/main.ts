@@ -18,91 +18,6 @@ import { LogUtils } from '../utils/logUtils';
 import { initializeStore } from './store';
 import { Platform } from 'obsidian';
 
-// Welcome Modal for first-time users
-class WelcomeModal extends Modal {
-    plugin: GoogleCalendarSyncPlugin;
-
-    constructor(app: App, plugin: GoogleCalendarSyncPlugin) {
-        super(app);
-        this.plugin = plugin;
-    }
-
-    onOpen() {
-        const { contentEl } = this;
-
-        // Create welcome header
-        contentEl.createEl('h2', { text: 'Welcome to Google Calendar Sync!' });
-        contentEl.createEl('p', {
-            text: 'This plugin synchronizes your Obsidian tasks with Google Calendar, helping you stay organized across platforms.'
-        });
-
-        // Create task formatting guide
-        const taskGuide = contentEl.createDiv('task-guide');
-        taskGuide.createEl('h3', { text: 'Task Formatting Guide' });
-        taskGuide.createEl('p', { text: 'Your tasks need specific formatting to sync with Google Calendar:' });
-
-        const exampleContainer = taskGuide.createDiv('example-container');
-        exampleContainer.createEl('pre', { text: '- [ ] Meeting with team 📅 2023-11-15 ⏰ 10:00 🔔 15m' });
-
-        // Create formatting explanation
-        const formatList = taskGuide.createEl('ul');
-        formatList.createEl('li', { text: '📅 Date (YYYY-MM-DD format)' });
-        formatList.createEl('li', { text: '⏰ Start time (HH:MM format)' });
-        formatList.createEl('li', { text: '➡️ End time - optional (HH:MM format)' });
-        formatList.createEl('li', { text: '🔔 Reminder - optional (number + m/h/d for minutes/hours/days)' });
-
-        // Create authentication section
-        const authSection = contentEl.createDiv('auth-section');
-        authSection.createEl('h3', { text: 'Connect with Google Calendar' });
-        authSection.createEl('p', {
-            text: 'To use this plugin, you\'ll need to connect to your Google Calendar account.'
-        });
-
-        // Sample task button
-        const buttonDiv = contentEl.createDiv('button-container');
-
-        // Sample task button
-        const sampleButton = buttonDiv.createEl('button', {
-            text: 'Insert Sample Task',
-            cls: 'mod-cta'
-        });
-        sampleButton.addEventListener('click', () => {
-            this.close();
-            this.plugin.insertSampleTask();
-        });
-
-        // Auth button
-        const authButton = buttonDiv.createEl('button', {
-            text: 'Connect to Google Calendar',
-            cls: 'mod-cta'
-        });
-        authButton.addEventListener('click', () => {
-            this.close();
-            if (this.plugin.authManager) {
-                this.plugin.authManager.authorize();
-            }
-        });
-
-        // Skip button
-        const skipButton = buttonDiv.createEl('button', {
-            text: 'Skip for now',
-            cls: ''
-        });
-        skipButton.addEventListener('click', () => {
-            this.close();
-        });
-
-        // Mark as completed
-        this.plugin.settings.hasCompletedOnboarding = true;
-        this.plugin.saveSettings();
-    }
-
-    onClose() {
-        const { contentEl } = this;
-        contentEl.empty();
-    }
-}
-
 export default class GoogleCalendarSyncPlugin extends Plugin {
     settings: GoogleCalendarSettings;
     public metadataManager: MetadataManager | null = null;
@@ -315,25 +230,6 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
             LogUtils.error('Failed to load plugin:', error);
             useStore.getState().setStatus('error', error as Error);
         }
-    }
-
-    public showWelcomeModal() {
-        new WelcomeModal(this.app, this).open();
-    }
-
-    public async insertSampleTask() {
-        const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
-        if (!activeView) {
-            new Notice('Open a markdown file first to insert a sample task');
-            return;
-        }
-
-        const cursor = activeView.editor.getCursor();
-        const today = new Date().toISOString().split('T')[0];
-        const sampleTask = `- [ ] Sample task synchronized with Google Calendar 📅 ${today} ⏰ 15:00 🔔 30m`;
-
-        activeView.editor.replaceRange(sampleTask + '\n', cursor);
-        new Notice('Sample task created!');
     }
 
     private registerEventHandlers() {
