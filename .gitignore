@@ -4,6 +4,7 @@ node_modules/
 # Build output
 main.js
 *.js.map
+obsidian-gcal-sync.zip
 
 # Environment variables and secrets
 .env
