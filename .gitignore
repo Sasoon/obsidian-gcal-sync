@@ -36,3 +36,4 @@ yarn-error.log*
 
 # Local scripts
 plugin-reload.sh 
+build.sh
