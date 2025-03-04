@@ -35,35 +35,37 @@ interface RateLimitState {
     lastRequest: number;
     requestCount: number;
     resetTime: number;
+    backoffMultiplier?: number;
 }
 
 export class CalendarSync {
     private readonly BASE_URL = 'https://www.googleapis.com/calendar/v3';
-    private readonly RATE_LIMIT = { requests: 500, window: 60 * 1000 }; // 500 requests per minute
+    private readonly DEFAULT_RATE_LIMIT = { requests: 400, window: 60 * 1000 }; // 400 requests per minute
     private rateLimit: RateLimitState = {
         lastRequest: 0,
         requestCount: 0,
-        resetTime: Date.now()
+        resetTime: 0,
+        backoffMultiplier: 1.0
     };
     private readonly plugin: GoogleCalendarSyncPlugin;
     private processingQueue = new Set<string>();
     private processingPromises = new Map<string, Promise<any>>();
-    
+
     // Cache to store events during a sync session
     private eventsCache: {
         events: GoogleCalendarEvent[] | null;
         timestamp: number;
         syncId: string;
     } = {
-        events: null,
-        timestamp: 0,
-        syncId: ''
-    };
+            events: null,
+            timestamp: 0,
+            syncId: ''
+        };
 
     constructor(plugin: GoogleCalendarSyncPlugin) {
         this.plugin = plugin;
     }
-    
+
     /**
      * Clears the events cache to force fresh data on next request
      */
@@ -101,7 +103,7 @@ export class CalendarSync {
 
         // Remove any 'task:' prefix if it exists
         const normalizedKey = lockKey.replace(/^task:/, '');
-        
+
         // Generate a unique operation ID for this specific lock attempt
         const operationId = `${normalizedKey}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
         LogUtils.debug(`Lock operation started: ${operationId} for ${normalizedKey}`);
@@ -116,7 +118,7 @@ export class CalendarSync {
         while (state.isTaskLocked(normalizedKey)) {
             if (Date.now() - startTime > maxWaitTime) {
                 LogUtils.warn(`Lock acquisition timeout for ${normalizedKey} (${operationId}) after ${maxWaitTime}ms`);
-                
+
                 // Instead of throwing, force-release the lock if it appears to be stale
                 const lockTime = state.getLockTimestamp(normalizedKey);
                 if (lockTime && Date.now() - lockTime > 30000) { // 30 second max lock time (reduced from 1 minute)
@@ -124,16 +126,16 @@ export class CalendarSync {
                     state.removeProcessingTask(normalizedKey);
                     break;
                 }
-                
+
                 throw new Error(`Failed to acquire lock for ${normalizedKey} after ${maxWaitTime}ms`);
             }
-            
+
             // Exponential backoff with jitter to prevent thundering herd
             const attempts = state.getLockAttempts(normalizedKey);
             const baseWait = Math.min(Math.pow(2, attempts) * 100, 1000);
             const jitter = Math.floor(Math.random() * 100); // Add random jitter
             const waitTime = baseWait + jitter;
-            
+
             LogUtils.debug(`Waiting ${waitTime}ms for lock on ${normalizedKey} (attempt ${attempts + 1})`);
             await new Promise(resolve => setTimeout(resolve, waitTime));
             state.incrementLockAttempts(normalizedKey);
@@ -142,14 +144,14 @@ export class CalendarSync {
         try {
             LogUtils.debug(`Acquired lock for ${normalizedKey} (${operationId})`);
             state.addProcessingTask(normalizedKey);
-            
+
             // Add operation timeout as an additional safety measure
             const timeoutPromise = new Promise<never>((_, reject) => {
                 setTimeout(() => {
                     reject(new Error(`Operation timeout for ${normalizedKey} (${operationId})`));
                 }, maxWaitTime);
             });
-            
+
             // Race between operation and timeout
             return await Promise.race([
                 operation(),
@@ -264,7 +266,7 @@ export class CalendarSync {
                 return undefined;
             }
         }
-        
+
         // If task is being processed, check if it's just a reminder change
         if (this.processingQueue.has(taskId)) {
             try {
@@ -364,7 +366,7 @@ export class CalendarSync {
 
                 // Get metadata and check for existing events
                 const metadata = this.plugin.settings.taskMetadata[task.id];
-                
+
                 // Use the cached events instead of making a new request each time
                 const events = await this.findAllObsidianEvents();
                 const taskEvents = events.filter(event =>
@@ -458,15 +460,15 @@ export class CalendarSync {
 
         // Get current time once to ensure consistency
         const currentTime = Date.now();
-        
+
         // Increment version counter for this task
         const state = useStore.getState();
         const currentVersion = existingMetadata?.version || 0;
         const newVersion = currentVersion + 1;
-        
+
         // Generate an operation ID for traceability
         const opId = `${task.id.substring(0, 4)}-${newVersion}-${Math.random().toString(36).substring(2, 5)}`;
-        
+
         LogUtils.debug(`Updating task metadata ${task.id} (op:${opId}) to version ${newVersion}`);
 
         // Add a "just synced" flag to prevent immediate reprocessing
@@ -488,7 +490,7 @@ export class CalendarSync {
             justSynced: true,                   // Flag to prevent double-syncing
             syncTimestamp: currentTime          // When the sync occurred
         };
-        
+
         LogUtils.debug(`⏰ Set justSynced and syncTimestamp=${currentTime} for task ${task.id}`); // Extra logging for debugging
 
         this.plugin.settings.taskMetadata[task.id] = metadata;
@@ -506,7 +508,7 @@ export class CalendarSync {
                 this.plugin.saveSettings();
             }
         }, 3500);  // 3.5 second cooldown - longer to ensure it covers all event handlers
-        
+
         // Clear the events cache to ensure fresh data for the next request
         // This is important after modifying an event
         this.clearEventsCache();
@@ -521,24 +523,43 @@ export class CalendarSync {
         const state = useStore.getState();
         const now = Date.now();
 
+        // Adaptive rate limiting - detect quota errors and adjust accordingly
+        const currentLimit = state.syncConfig?.calendarRateLimit || this.DEFAULT_RATE_LIMIT.requests;
+        const currentWindow = state.syncConfig?.calendarRateWindow || this.DEFAULT_RATE_LIMIT.window;
+        const backoffMultiplier = state.rateLimit.backoffMultiplier || 1.0;
+
         // Reset rate limit if we're past the window
         if (now > state.rateLimit.resetTime) {
+            // Gradually recover from backoff if we've been successful
+            if (backoffMultiplier > 1.0) {
+                const newMultiplier = Math.max(1.0, backoffMultiplier * 0.9); // Gradually reduce backoff
+                state.updateRateLimit({ backoffMultiplier: newMultiplier });
+
+                if (newMultiplier < 1.1) { // If we're close to normal, reset completely
+                    state.updateRateLimit({ backoffMultiplier: 1.0 });
+                    LogUtils.debug("Rate limit backoff reset to normal");
+                }
+            }
+
             state.resetRateLimit();
             return;
         }
 
+        // Calculate effective limit with backoff applied
+        const effectiveLimit = Math.floor(currentLimit / backoffMultiplier);
+
         // If we've hit the limit, wait until reset time
-        if (state.rateLimit.requestCount >= state.rateLimit.maxRequests) {
+        if (state.rateLimit.requestCount >= effectiveLimit) {
             const waitTime = state.rateLimit.resetTime - now;
-            LogUtils.warn(`Rate limit reached, waiting ${waitTime}ms`);
+            LogUtils.warn(`Rate limit reached (${state.rateLimit.requestCount}/${effectiveLimit}), waiting ${Math.round(waitTime / 1000)}s with backoff multiplier ${backoffMultiplier.toFixed(2)}`);
 
             // Create a cancellable wait promise with timeout reporting
             let waitComplete = false;
             const waitPromise = new Promise<void>(resolve => {
                 const interval = window.setInterval(() => {
                     const remaining = Math.max(0, state.rateLimit.resetTime - Date.now());
-                    if (remaining % 5000 === 0) { // Log every 5 seconds
-                        LogUtils.debug(`Still waiting for rate limit: ${remaining}ms remaining`);
+                    if (remaining % 5000 === 0 && remaining > 0) { // Log every 5 seconds
+                        LogUtils.debug(`Still waiting for rate limit: ${Math.round(remaining / 1000)}s remaining`);
                     }
                     if (remaining <= 0 || waitComplete) {
                         clearInterval(interval);
@@ -563,94 +584,154 @@ export class CalendarSync {
     }
 
     private async makeRequest(endpoint: string, method: string, params?: any): Promise<any> {
-        await this.checkRateLimit();
+        try {
+            // Check rate limit before making the request
+            await this.checkRateLimit();
 
-        return retryWithBackoff(async () => {
-            try {
-                if (!this.plugin.authManager) {
-                    throw new Error('Auth manager not initialized');
-                }
+            if (!this.plugin.authManager) {
+                throw new Error('Auth manager not initialized');
+            }
 
-                const accessToken = await this.plugin.authManager.getValidAccessToken();
-                const url = `${this.BASE_URL}${endpoint}`;
+            const accessToken = await this.plugin.authManager.getValidAccessToken();
+            const url = `${this.BASE_URL}${endpoint}`;
 
-                const requestUrlString = method === 'GET' && params ?
-                    `${url}?${new URLSearchParams(params)}` :
-                    url;
+            const requestUrlString = method === 'GET' && params ?
+                `${url}?${new URLSearchParams(params)}` :
+                url;
 
-                LogUtils.debug(`Making API request: ${method} ${endpoint}`);
-                if (this.plugin.settings.verboseLogging) {
-                    LogUtils.debug(`Request details: 
+            LogUtils.debug(`Making API request: ${method} ${endpoint}`);
+            if (this.plugin.settings.verboseLogging) {
+                LogUtils.debug(`Request details: 
+                    URL: ${requestUrlString}
+                    Method: ${method}
+                    Params: ${params ? JSON.stringify(params) : 'none'}`
+                );
+            }
+
+            const response = await requestUrl({
+                url: requestUrlString,
+                method,
+                headers: {
+                    'Authorization': `Bearer ${accessToken}`,
+                    'Content-Type': 'application/json',
+                },
+                body: method !== 'GET' && params ? JSON.stringify(params) : undefined
+            });
+
+            // Special handling for 410 Gone on DELETE requests
+            if (response.status === 410 && method === 'DELETE') {
+                LogUtils.debug('Resource already deleted');
+                return null;
+            }
+
+            if (response.status >= 400) {
+                // Log full error details
+                LogUtils.error(`API request failed (${method} ${endpoint}): 
+                    Status: ${response.status}
+                    Response: ${response.text}`
+                );
+
+                const error = new Error(`Request failed, status ${response.status}: ${response.text}`);
+                (error as any).status = response.status;
+                (error as any).response = response.text;
+                throw error;
+            }
+
+            // For DELETE requests or empty responses, return null
+            if (method === 'DELETE' || !response.text) {
+                return null;
+            }
+
+            LogUtils.debug(`API request successful: ${method} ${endpoint}`);
+            return response.json;
+        } catch (error) {
+            return retryWithBackoff(async () => {
+                try {
+                    if (!this.plugin.authManager) {
+                        throw new Error('Auth manager not initialized');
+                    }
+
+                    const accessToken = await this.plugin.authManager.getValidAccessToken();
+                    const url = `${this.BASE_URL}${endpoint}`;
+
+                    const requestUrlString = method === 'GET' && params ?
+                        `${url}?${new URLSearchParams(params)}` :
+                        url;
+
+                    LogUtils.debug(`Making API request: ${method} ${endpoint}`);
+                    if (this.plugin.settings.verboseLogging) {
+                        LogUtils.debug(`Request details: 
                         URL: ${requestUrlString}
                         Method: ${method}
                         Params: ${params ? JSON.stringify(params) : 'none'}`
-                    );
-                }
+                        );
+                    }
 
-                const response = await requestUrl({
-                    url: requestUrlString,
-                    method,
-                    headers: {
-                        'Authorization': `Bearer ${accessToken}`,
-                        'Content-Type': 'application/json',
-                    },
-                    body: method !== 'GET' && params ? JSON.stringify(params) : undefined
-                });
+                    const response = await requestUrl({
+                        url: requestUrlString,
+                        method,
+                        headers: {
+                            'Authorization': `Bearer ${accessToken}`,
+                            'Content-Type': 'application/json',
+                        },
+                        body: method !== 'GET' && params ? JSON.stringify(params) : undefined
+                    });
 
-                // Special handling for 410 Gone on DELETE requests
-                if (response.status === 410 && method === 'DELETE') {
-                    LogUtils.debug('Resource already deleted');
-                    return null;
-                }
+                    // Special handling for 410 Gone on DELETE requests
+                    if (response.status === 410 && method === 'DELETE') {
+                        LogUtils.debug('Resource already deleted');
+                        return null;
+                    }
 
-                if (response.status >= 400) {
-                    // Log full error details
-                    LogUtils.error(`API request failed (${method} ${endpoint}): 
+                    if (response.status >= 400) {
+                        // Log full error details
+                        LogUtils.error(`API request failed (${method} ${endpoint}): 
                         Status: ${response.status}
                         Response: ${response.text}`
-                    );
+                        );
 
-                    const error = new Error(`Request failed, status ${response.status}: ${response.text}`);
-                    (error as any).status = response.status;
-                    (error as any).response = response.text;
-                    throw error;
-                }
+                        const error = new Error(`Request failed, status ${response.status}: ${response.text}`);
+                        (error as any).status = response.status;
+                        (error as any).response = response.text;
+                        throw error;
+                    }
 
-                // For DELETE requests or empty responses, return null
-                if (method === 'DELETE' || !response.text) {
-                    return null;
-                }
+                    // For DELETE requests or empty responses, return null
+                    if (method === 'DELETE' || !response.text) {
+                        return null;
+                    }
 
-                LogUtils.debug(`API request successful: ${method} ${endpoint}`);
-                return response.json;
-            } catch (error) {
-                // Don't log 410 errors for DELETE requests as they're expected
-                if (!(error instanceof Error && error.message.includes('status 410') && method === 'DELETE')) {
-                    LogUtils.error(`API request failed (${method} ${endpoint}): ${error}`);
+                    LogUtils.debug(`API request successful: ${method} ${endpoint}`);
+                    return response.json;
+                } catch (error) {
+                    // Don't log 410 errors for DELETE requests as they're expected
+                    if (!(error instanceof Error && error.message.includes('status 410') && method === 'DELETE')) {
+                        LogUtils.error(`API request failed (${method} ${endpoint}): ${error}`);
 
-                    // Add better error information for debugging
-                    if (this.plugin.settings.verboseLogging) {
-                        LogUtils.error(`Request details: 
+                        // Add better error information for debugging
+                        if (this.plugin.settings.verboseLogging) {
+                            LogUtils.error(`Request details: 
                             Endpoint: ${endpoint}
                             Method: ${method}
                             Params: ${params ? JSON.stringify(params) : 'none'}
                             Error: ${(error as Error).message}
                             Stack: ${(error as Error).stack}`
-                        );
-                    }
+                            );
+                        }
 
-                    // Show a notice for specific errors
-                    if ((error as any).status === 400) {
-                        new Notice(`Calendar API error (400): Check your authenticated account has calendar access`);
-                    } else if ((error as any).status === 401) {
-                        new Notice(`Authentication error (401): Your session has expired. Please reconnect to Google Calendar.`);
-                    } else if ((error as any).status === 403) {
-                        new Notice(`Permission error (403): You don't have permission to access this calendar.`);
+                        // Show a notice for specific errors
+                        if ((error as any).status === 400) {
+                            new Notice(`Calendar API error (400): Check your authenticated account has calendar access`);
+                        } else if ((error as any).status === 401) {
+                            new Notice(`Authentication error (401): Your session has expired. Please reconnect to Google Calendar.`);
+                        } else if ((error as any).status === 403) {
+                            new Notice(`Permission error (403): You don't have permission to access this calendar.`);
+                        }
                     }
+                    throw ErrorUtils.handleCommonErrors(error);
                 }
-                throw ErrorUtils.handleCommonErrors(error);
-            }
-        });
+            });
+        }
     }
 
     public getTimezoneOffset(): string {
@@ -666,10 +747,10 @@ export class CalendarSync {
 
             // Use the cached events instead of making a new request
             const events = await this.findAllObsidianEvents();
-            const matchingEvents = events.filter(event => 
+            const matchingEvents = events.filter(event =>
                 event.extendedProperties?.private?.obsidianTaskId === task.id
             );
-            
+
             if (matchingEvents.length > 0) {
                 const event = matchingEvents[0]; // Should only ever be one event with this ID
                 LogUtils.debug(`Found existing event ${event.id} for task ${task.id}`);
@@ -695,20 +776,20 @@ export class CalendarSync {
         try {
             // Generate a cache key based on the time parameters
             const cacheKey = `events-${timeMin || 'none'}-${timeMax || 'none'}`;
-            
+
             // Check cache first, unless forced to get fresh data
-            if (!forceFresh && 
-                this.eventsCache.events && 
+            if (!forceFresh &&
+                this.eventsCache.events &&
                 this.eventsCache.syncId === cacheKey &&
                 Date.now() - this.eventsCache.timestamp < 10000) {  // Cache valid for longer period (10 seconds)
-                
+
                 LogUtils.debug(`[CACHE HIT] Using cached events (${this.eventsCache.events.length} events, age: ${Date.now() - this.eventsCache.timestamp}ms)`);
                 return this.eventsCache.events;
             }
-            
+
             // Cache miss or forced refresh, fetch from API with clear logging
             LogUtils.debug(`[CACHE MISS] Fetching events from Google Calendar API`);
-            
+
             const params: any = {
                 singleEvents: true,
                 privateExtendedProperty: 'isObsidianTask=true',
@@ -882,11 +963,11 @@ export class CalendarSync {
                 // Force file cache invalidation
                 const state = useStore.getState();
                 state.invalidateFileCache(metadata.filePath);
-                
+
                 // Add a small delay to ensure filesystem has the latest content
                 await new Promise(resolve => setTimeout(resolve, 100));
             }
-            
+
             // Now get the task with fresh data
             return this.plugin.taskParser.getTaskById(taskId);
         } catch (error) {

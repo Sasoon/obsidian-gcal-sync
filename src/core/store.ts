@@ -56,6 +56,8 @@ export interface TaskStore {
         maxCacheSize: number;
         maxRetries: number;
         retryDelay: number;
+        calendarRateLimit?: number; // Added for new rate limiting
+        calendarRateWindow?: number; // Added for new rate limiting
     };
 
     // Rate Limiting
@@ -65,6 +67,7 @@ export interface TaskStore {
         resetTime: number;
         window: number;
         maxRequests: number;
+        backoffMultiplier: number; // Add backoff multiplier support
     };
 
     // Sync Queue State
@@ -286,7 +289,8 @@ export const store = createStore<TaskStore>()(
                     requestCount: 0,
                     resetTime: 0,
                     window: 100 * 1000, // 100 second window
-                    maxRequests: 100 // max 100 requests per window
+                    maxRequests: 100, // max 100 requests per window
+                    backoffMultiplier: 1.5, // Add backoff multiplier support
                 },
 
                 // Sync Queue State
@@ -319,20 +323,20 @@ export const store = createStore<TaskStore>()(
                                 // Skip the redundant pre-check for changes - we trust the caller
                                 // The caller has already determined this task needs to be synced
                                 // This helps avoid race conditions where metadata was just updated
-                                
+
                                 // But log the task state for debugging purposes
                                 const existingMetadata = state.plugin.settings.taskMetadata?.[task.id];
                                 if (state.plugin.settings.verboseLogging) {
                                     LogUtils.debug(`Enqueueing task ${task.id}:
                                         Task state: title=${task.title}, date=${task.date}, reminder=${task.reminder}
-                                        Metadata: ${existingMetadata ? 
-                                            `title=${existingMetadata.title}, date=${existingMetadata.date}, reminder=${existingMetadata.reminder}` : 
+                                        Metadata: ${existingMetadata ?
+                                            `title=${existingMetadata.title}, date=${existingMetadata.date}, reminder=${existingMetadata.reminder}` :
                                             'none'}`);
                                 }
 
                                 // Check for specific conditions that would cause us to skip enqueueing
                                 const metadata = state.plugin.settings.taskMetadata?.[task.id];
-                                
+
                                 // Skip if the task was just synced (within last 1.5 seconds)
                                 if (metadata?.justSynced && metadata.syncTimestamp) {
                                     const syncAge = Date.now() - metadata.syncTimestamp;
@@ -341,7 +345,7 @@ export const store = createStore<TaskStore>()(
                                         return;
                                     }
                                 }
-                                
+
                                 // Check if task is already being processed
                                 if (state.processingTasks.has(task.id)) {
                                     // Instead of skipping, add to sync queue for later processing
@@ -355,13 +359,13 @@ export const store = createStore<TaskStore>()(
 
                                 // Check if already in queue first (for logging)
                                 const alreadyInQueue = state.syncQueue.has(task.id);
-                                
+
                                 // Always add to queue - we'll deduplicate later when processing
                                 // This ensures changes made during processing aren't missed
                                 LogUtils.debug(`Enqueueing task ${task.id} with title='${task.title}', reminder=${task.reminder}`);
                                 state.syncQueue.add(task.id);
                                 validTaskIds.push(task.id);
-                                
+
                                 // Only count as newly added if it wasn't in the queue before
                                 if (!alreadyInQueue) {
                                     newTasksAdded.push(task.id);
@@ -586,7 +590,7 @@ export const store = createStore<TaskStore>()(
                         // Filter out tasks that were just synced to avoid redundant processing
                         const filteredTasks = tasks.filter(task => {
                             if (!task.id) return false;
-                            
+
                             // Check if task was just synced
                             const metadata = state.plugin.settings.taskMetadata[task.id];
                             if (metadata?.justSynced && metadata.syncTimestamp) {
@@ -600,11 +604,11 @@ export const store = createStore<TaskStore>()(
                             }
                             return true;
                         });
-                        
+
                         // Process filtered tasks in batches
                         const actualTaskCount = filteredTasks.length;
                         LogUtils.debug(`After filtering, processing ${actualTaskCount}/${totalTasks} tasks`);
-                        
+
                         for (let i = 0; i < filteredTasks.length; i += batchSize) {
                             const batch = filteredTasks.slice(i, i + batchSize);
 
@@ -779,22 +783,22 @@ export const store = createStore<TaskStore>()(
                     set(state => {
                         const now = Date.now();
                         let staleLocksCleared = 0;
-                        
+
                         // Collect all locks to check in an array first to avoid mutation during iteration
                         const locksToCheck = Array.from(state.lockTimeouts.entries());
-                        
+
                         // First pass: identify stale locks
                         const staleKeys = locksToCheck
                             .filter(([_, timeoutValue]) => now > timeoutValue)
                             .map(([key]) => key);
-                            
+
                         // Log stale lock information with acquisition time if available
                         for (const lockKey of staleKeys) {
                             const lockTime = state.lockTimestamps?.get(lockKey);
                             const lockDuration = lockTime ? (now - lockTime) : 'unknown';
-                            
+
                             LogUtils.warn(`Clearing stale lock for ${lockKey} (held for ${lockDuration}ms)`);
-                            
+
                             // Remove from all lock-related collections
                             state.processingTasks.delete(lockKey);
                             state.locks.delete(lockKey);
@@ -802,10 +806,10 @@ export const store = createStore<TaskStore>()(
                             if (state.lockTimestamps) {
                                 state.lockTimestamps.delete(lockKey);
                             }
-                            
+
                             staleLocksCleared++;
                         }
-                        
+
                         if (staleLocksCleared > 0) {
                             LogUtils.debug(`Cleared ${staleLocksCleared} stale locks`);
                         }
@@ -818,7 +822,7 @@ export const store = createStore<TaskStore>()(
                     }
                     state.lockTimeouts.clear();
                     state.lockAttempts.clear();
-                    
+
                     // Clear lock timestamps if they exist
                     if (state.lockTimestamps) {
                         state.lockTimestamps.clear();
@@ -842,7 +846,7 @@ export const store = createStore<TaskStore>()(
                     const state = get();
                     return state.locks.has(taskId) || state.processingTasks.has(taskId);
                 },
-                
+
                 getLockTimestamp: (taskId: string) => {
                     const state = get();
                     // Safely access the timestamps map which might not exist in older data
@@ -1006,7 +1010,10 @@ export const store = createStore<TaskStore>()(
                             ...state.rateLimit,
                             lastRequest: now,
                             requestCount: 0,
-                            resetTime: now + state.rateLimit.window
+                            resetTime: now + state.rateLimit.window,
+                            window: state.rateLimit.window,
+                            maxRequests: state.rateLimit.maxRequests,
+                            backoffMultiplier: state.rateLimit.backoffMultiplier || 1.0
                         };
                     }),
 

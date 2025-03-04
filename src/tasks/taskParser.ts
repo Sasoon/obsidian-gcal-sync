@@ -29,19 +29,63 @@ export class TaskParser {
     constructor(private plugin: GoogleCalendarSyncPlugin) { }
 
     private getFilteredFiles(): TFile[] {
-        if (this.plugin.settings.includeFolders.length > 0) {
-            return this.plugin.settings.includeFolders
-                .flatMap(folder => {
-                    const file = this.plugin.app.vault.getAbstractFileByPath(folder);
-                    if (file instanceof TFile) {
-                        return [file];
-                    }
-                    // If it's a folder, get all markdown files in it
-                    return this.plugin.app.vault.getMarkdownFiles()
-                        .filter(f => f.path.startsWith(folder));
-                });
+        const allFiles = this.plugin.app.vault.getMarkdownFiles();
+        
+        // If no include settings, return all files
+        if (!this.plugin.settings.includeFolders || this.plugin.settings.includeFolders.length === 0) {
+            return allFiles;
         }
-        return this.plugin.app.vault.getMarkdownFiles();
+        
+        // Create result array for matched files
+        const matchedFiles: TFile[] = [];
+        
+        // Process each inclusion path
+        for (const includePath of this.plugin.settings.includeFolders) {
+            // Check if this is a direct file reference (not ending with /)
+            const isLikelyFile = !includePath.endsWith('/') && includePath.includes('.');
+            
+            if (isLikelyFile) {
+                // Try to get this specific file
+                const exactFile = allFiles.find(file => file.path === includePath);
+                if (exactFile) {
+                    matchedFiles.push(exactFile);
+                    continue;
+                }
+            }
+            
+            // Handle as folder (strict matching with trailing slash)
+            const folderMatchedFiles = allFiles.filter(file => 
+                file.path === includePath || file.path.startsWith(includePath + '/')
+            );
+            
+            if (folderMatchedFiles.length > 0) {
+                matchedFiles.push(...folderMatchedFiles);
+                continue;
+            }
+            
+            // Try lenient folder matching (without trailing slash)
+            const folderNoSlash = includePath.endsWith('/') ? includePath.slice(0, -1) : includePath;
+            const lenientMatches = allFiles.filter(file => 
+                file.path === folderNoSlash || file.path.startsWith(folderNoSlash + '/')
+            );
+            
+            if (lenientMatches.length > 0) {
+                matchedFiles.push(...lenientMatches);
+            }
+        }
+        
+        // Remove duplicates
+        const uniqueFiles = Array.from(new Set(matchedFiles.map(file => file.path)))
+            .map(path => allFiles.find(file => file.path === path))
+            .filter((file): file is TFile => file !== undefined);
+        
+        // If no files found after all approaches, use all files with a warning
+        if (uniqueFiles.length === 0) {
+            LogUtils.warn(`No files match folder inclusion settings. Using all files as fallback. Check your settings.`);
+            return allFiles;
+        }
+        
+        return uniqueFiles;
     }
 
     public async parseTasksFromFile(file: TFile): Promise<Task[]> {

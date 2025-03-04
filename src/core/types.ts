@@ -61,13 +61,7 @@ export interface TaskMetadata {
 export interface GoogleCalendarSettings {
     clientId: string;
     clientSecret?: string;
-    oauth2Tokens?: {
-        access_token: string;
-        refresh_token: string;
-        scope: string;
-        token_type: string;
-        expiry_date: number;
-    };
+    oauth2Tokens?: OAuth2Tokens;
     syncEnabled: boolean;
     defaultReminder: number;
     includeFolders: string[];
@@ -98,6 +92,7 @@ export interface OAuth2Tokens {
     scope: string;
     token_type: string;
     expiry_date: number;
+    stored_at?: number; // When the tokens were stored
 }
 
 export interface FileChangeEvent {

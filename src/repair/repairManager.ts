@@ -139,33 +139,166 @@ export class RepairManager {
                 updateProgress(progress, RepairPhases.metadata, RepairOperations.CLEANUP_METADATA);
             });
 
-            // Sync phase - use the existing sync queue mechanism
+            // Enhanced Sync phase - more robust rebuilding of events
             if (tasks.size > 0) {
                 const store = useStore.getState();
                 store.startSync();
                 store.enableTempSync();
 
                 try {
-                    // Clear existing queue and add all tasks
+                    // Clear existing queue
                     store.clearSyncQueue();
                     const taskArray = Array.from(tasks.values());
-                    await store.enqueueTasks(taskArray);
-
-                    // Process queue immediately
-                    await store.processSyncQueueNow();
-
-                    // Track processed tasks and errors
-                    taskArray.forEach(task => {
-                        if (task.id) {
-                            const failedSync = store.failedSyncs.get(task.id);
-                            if (failedSync) {
-                                errors.set(task.id, failedSync.error);
-                            } else {
-                                processed.add(task.id);
+                    
+                    // Group tasks into those with existing events and those without
+                    const tasksWithEvents: Task[] = [];
+                    const tasksWithoutEvents: Task[] = [];
+                    
+                    // Build a lookup map of task IDs to calendar events
+                    const eventsByTaskId = new Map<string, GoogleCalendarEvent>();
+                    calendarEvents.forEach(event => {
+                        const taskId = event.extendedProperties?.private?.obsidianTaskId;
+                        if (taskId) {
+                            // Only store the most recent event for each task
+                            const existing = eventsByTaskId.get(taskId);
+                            if (!existing || new Date(event.updated || 0) > new Date(existing.updated || 0)) {
+                                eventsByTaskId.set(taskId, event);
                             }
                         }
                     });
-
+                    
+                    // Group tasks based on whether they have calendar events and completion status
+                    const tasksToDelete: Task[] = [];
+                    
+                    taskArray.forEach(task => {
+                        if (!task.id) return;
+                        
+                        // First check if task is completed
+                        if (task.completed) {
+                            // Completed tasks should have their events deleted
+                            if (eventsByTaskId.has(task.id)) {
+                                tasksToDelete.push(task);
+                                LogUtils.debug(`Task ${task.id} is completed, will delete associated event`);
+                            } else {
+                                // Already has no event, no action needed
+                                processed.add(task.id);
+                                LogUtils.debug(`Task ${task.id} is completed and has no event, no action needed`);
+                            }
+                        } else {
+                            // Not completed, normal event handling
+                            if (eventsByTaskId.has(task.id)) {
+                                tasksWithEvents.push(task);
+                            } else {
+                                tasksWithoutEvents.push(task);
+                                LogUtils.debug(`Task ${task.id} missing calendar event, will recreate`);
+                            }
+                        }
+                    });
+                    
+                    // First, delete events for completed tasks
+                    if (tasksToDelete.length > 0) {
+                        LogUtils.debug(`Deleting events for ${tasksToDelete.length} completed tasks`);
+                        
+                        for (const task of tasksToDelete) {
+                            if (!task.id) continue;
+                            
+                            try {
+                                // Get the event ID for this task
+                                const event = eventsByTaskId.get(task.id);
+                                if (event && this.plugin.calendarSync) {
+                                    // Delete the event
+                                    await this.plugin.calendarSync.deleteEvent(event.id, task.id);
+                                    LogUtils.debug(`Deleted event ${event.id} for completed task ${task.id}`);
+                                    
+                                    // Clean up metadata
+                                    if (this.plugin.settings.taskMetadata[task.id]) {
+                                        delete this.plugin.settings.taskMetadata[task.id];
+                                    }
+                                    
+                                    processed.add(task.id);
+                                }
+                            } catch (error) {
+                                LogUtils.error(`Failed to delete event for task ${task.id}:`, error);
+                                errors.set(task.id, error as Error);
+                            }
+                        }
+                        
+                        // Save settings after batch processing
+                        await this.plugin.saveSettings();
+                    }
+                    
+                    // Next, explicitly create events for tasks without them
+                    let processedCount = 0;
+                    const batchSize = this.calculateOptimalBatchSize(tasksWithoutEvents.length);
+                    const totalBatches = Math.ceil(tasksWithoutEvents.length / batchSize);
+                    
+                    LogUtils.debug(`Creating events for ${tasksWithoutEvents.length} tasks without events (${totalBatches} batches of ~${batchSize})`);
+                    
+                    for (let i = 0; i < tasksWithoutEvents.length; i += batchSize) {
+                        const batch = tasksWithoutEvents.slice(i, i + batchSize);
+                        const batchNum = Math.floor(i / batchSize) + 1;
+                        
+                        const results = await Promise.allSettled(
+                            batch.map(async (task) => {
+                                if (!task.id) return;
+                                
+                                try {
+                                    // Force create new event
+                                    if (this.plugin.calendarSync) {
+                                        const eventId = await this.plugin.calendarSync.createEvent(task);
+                                        processed.add(task.id);
+                                        return { taskId: task.id, eventId, success: true };
+                                    }
+                                } catch (error) {
+                                    errors.set(task.id, error as Error);
+                                    return { taskId: task.id, success: false, error };
+                                }
+                            })
+                        );
+                        
+                        processedCount += batch.length;
+                        
+                        onProgress?.({
+                            phase: 'create',
+                            processedItems: processedCount,
+                            totalItems: tasksWithoutEvents.length,
+                            currentOperation: 'Creating missing events',
+                            failedItems: Array.from(errors.keys()),
+                            retryCount: 0,
+                            currentBatch: batchNum,
+                            errors: Array.from(errors.entries()).map(([id, error]) => ({
+                                id,
+                                error: error.message
+                            }))
+                        });
+                        
+                        // Small delay between batches
+                        if (i + batchSize < tasksWithoutEvents.length) {
+                            await new Promise(resolve => setTimeout(resolve, 200));
+                        }
+                    }
+                    
+                    // Then use the regular sync mechanism for tasks with existing events
+                    if (tasksWithEvents.length > 0) {
+                        LogUtils.debug(`Updating ${tasksWithEvents.length} tasks with existing events`);
+                        
+                        // Add tasks to queue and process
+                        await store.enqueueTasks(tasksWithEvents);
+                        await store.processSyncQueueNow();
+                        
+                        // Track processed tasks and errors
+                        tasksWithEvents.forEach(task => {
+                            if (task.id) {
+                                const failedSync = store.failedSyncs.get(task.id);
+                                if (failedSync) {
+                                    errors.set(task.id, failedSync.error);
+                                } else {
+                                    processed.add(task.id);
+                                }
+                            }
+                        });
+                    }
+                    
                     onProgress?.({
                         phase: 'update',
                         processedItems: processed.size,
@@ -183,6 +316,8 @@ export class RepairManager {
                     store.disableTempSync();
                     store.endSync(errors.size === 0);
                 }
+            } else {
+                LogUtils.debug('No tasks found to repair. This is unusual - check if tasks have IDs.');
             }
 
             // Verify final state
@@ -369,16 +504,51 @@ export class RepairManager {
     private async getAllTasks(): Promise<Map<string, Task>> {
         const tasks = new Map<string, Task>();
         const files = await this.getMarkdownFiles();
-
-        for (const file of files) {
-            const fileTasks = await this.plugin.taskParser.parseTasksFromFile(file);
-            for (const task of fileTasks) {
-                if (task.id) {
-                    tasks.set(task.id, task);
+        
+        LogUtils.debug(`Searching for tasks in ${files.length} markdown files`);
+        
+        // Force clear the file cache to ensure we get fresh content
+        const state = useStore.getState();
+        
+        // Process files in batches to avoid overwhelming the system
+        const BATCH_SIZE = 20;
+        for (let i = 0; i < files.length; i += BATCH_SIZE) {
+            const batch = files.slice(i, i + BATCH_SIZE);
+            
+            // Process each file in the batch
+            for (const file of batch) {
+                try {
+                    // Force cache invalidation for every file
+                    state.invalidateFileCache(file.path);
+                    
+                    // Small delay to allow for filesystem operations
+                    await new Promise(resolve => setTimeout(resolve, 20));
+                    
+                    // Parse tasks from this file
+                    const fileTasks = await this.plugin.taskParser.parseTasksFromFile(file);
+                    
+                    // Add tasks with IDs to our collection
+                    for (const task of fileTasks) {
+                        if (task.id) {
+                            tasks.set(task.id, task);
+                        }
+                    }
+                    
+                    if (fileTasks.length > 0) {
+                        LogUtils.debug(`Found ${fileTasks.length} tasks in ${file.path}`);
+                    }
+                } catch (error) {
+                    LogUtils.error(`Error parsing tasks from ${file.path}:`, error);
                 }
             }
+            
+            // Small delay between batches
+            if (i + BATCH_SIZE < files.length) {
+                await new Promise(resolve => setTimeout(resolve, 100));
+            }
         }
-
+        
+        LogUtils.debug(`Found a total of ${tasks.size} tasks with IDs across all files`);
         return tasks;
     }
 
@@ -397,11 +567,76 @@ export class RepairManager {
     }
 
     private async getMarkdownFiles(): Promise<TFile[]> {
-        if (this.plugin.settings.includeFolders.length > 0) {
-            return this.plugin.settings.includeFolders
-                .map((folder: string) => this.plugin.app.vault.getAbstractFileByPath(folder))
-                .filter((file): file is TFile => file instanceof TFile);
+        // Get all markdown files in the vault
+        const allFiles = this.plugin.app.vault.getMarkdownFiles();
+        LogUtils.debug(`Found ${allFiles.length} total markdown files in vault`);
+        
+        // Log the include folder settings
+        const includeSettings = this.plugin.settings.includeFolders || [];
+        LogUtils.debug(`Folder inclusion settings: ${includeSettings.length > 0 ? JSON.stringify(includeSettings) : 'None (all files included)'}`);
+        
+        // If no include settings specified, return all markdown files
+        if (!includeSettings.length) {
+            LogUtils.debug(`Using all ${allFiles.length} markdown files for task search`);
+            return allFiles;
         }
-        return this.plugin.app.vault.getMarkdownFiles();
+        
+        // Create result array for matched files
+        const matchedFiles: TFile[] = [];
+        
+        // Process each inclusion path
+        for (const includePath of includeSettings) {
+            // Check if this is a direct file reference (not ending with /)
+            const isLikelyFile = !includePath.endsWith('/') && includePath.includes('.');
+            
+            if (isLikelyFile) {
+                // Try to get this specific file
+                const exactFile = allFiles.find(file => file.path === includePath);
+                if (exactFile) {
+                    LogUtils.debug(`Found exact file match: ${includePath}`);
+                    matchedFiles.push(exactFile);
+                    continue;
+                }
+            }
+            
+            // Handle as folder (strict matching with trailing slash)
+            const folderMatchedFiles = allFiles.filter(file => 
+                file.path === includePath || file.path.startsWith(includePath + '/')
+            );
+            
+            if (folderMatchedFiles.length > 0) {
+                LogUtils.debug(`Found ${folderMatchedFiles.length} files in folder: ${includePath}`);
+                matchedFiles.push(...folderMatchedFiles);
+                continue;
+            }
+            
+            // Try lenient folder matching (without trailing slash)
+            const folderNoSlash = includePath.endsWith('/') ? includePath.slice(0, -1) : includePath;
+            const lenientMatches = allFiles.filter(file => 
+                file.path === folderNoSlash || file.path.startsWith(folderNoSlash + '/')
+            );
+            
+            if (lenientMatches.length > 0) {
+                LogUtils.debug(`Found ${lenientMatches.length} files with lenient matching for: ${includePath}`);
+                matchedFiles.push(...lenientMatches);
+            }
+        }
+        
+        // Remove duplicates
+        const uniqueFiles = Array.from(new Set(matchedFiles.map(file => file.path)))
+            .map(path => allFiles.find(file => file.path === path))
+            .filter((file): file is TFile => file !== undefined);
+        
+        LogUtils.debug(`After filtering: ${uniqueFiles.length} markdown files match inclusion settings`);
+        
+        // If no files found after all approaches, use all files with a warning
+        if (uniqueFiles.length === 0) {
+            LogUtils.warn(`WARNING: No files match your folder inclusion settings. ` +
+                          `Using all vault files as a fallback for repair. ` +
+                          `Check your folder inclusion settings in the plugin settings.`);
+            return allFiles;
+        }
+        
+        return uniqueFiles;
     }
 } 

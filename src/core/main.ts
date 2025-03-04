@@ -42,8 +42,6 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
             await this.loadSettings();
             const credentials = loadGoogleCredentials();
             this.settings.clientId = credentials.clientId;
-            // We no longer store the client secret in the plugin settings
-            // as it's now securely stored in the Netlify function
 
             // Always disable welcome modal
             this.settings.hasCompletedOnboarding = true;
@@ -66,6 +64,11 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
                 if (this.authManager) {
                     try {
                         console.log('Received protocol callback with parameters:', params);
+
+                        if (!params.code) {
+                            throw new Error('Missing authorization code in callback parameters');
+                        }
+
                         await this.authManager.handleProtocolCallback(params);
 
                         // Successfully authenticated, show success message
@@ -83,11 +86,30 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
                         await this.initializeCalendarSync();
                     } catch (error) {
                         console.error('Error handling protocol callback:', error);
+
+                        // Provide more specific error messages based on error type
+                        let errorMessage = 'Authentication failed. Please try connecting again.';
+
+                        if (error instanceof Error) {
+                            if (error.message.includes('network')) {
+                                errorMessage = 'Network error during authentication. Check your internet connection and try again.';
+                            } else if (error.message.includes('invalid_grant')) {
+                                errorMessage = 'Invalid authorization. Please try authenticating again.';
+                            } else if (error.message.includes('access_denied')) {
+                                errorMessage = 'Access was denied. Please grant all required permissions when authenticating.';
+                            } else if (error.message.includes('Missing authorization code')) {
+                                errorMessage = 'Missing authorization data. Please complete the full authentication process.';
+                            }
+                        }
+
                         // Show a specific error notice that gives clearer instruction
-                        new Notice('Authentication failed. Please try connecting again.');
+                        new Notice(errorMessage, 10000); // Show for 10 seconds for better visibility
+
                         // Update UI state
                         useStore.getState().setStatus('disconnected');
                         useStore.getState().setAuthenticated(false);
+                        // Store error in status
+                        useStore.getState().setStatus('error', error instanceof Error ? error : new Error(String(error)));
                     }
                 }
             });
@@ -96,9 +118,16 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
                 await this.authManager.loadSavedTokens();
             } catch (e) {
                 console.error('Failed to load saved tokens, clearing authentication state:', e);
+
+                // Log specific error for debugging
+                if (e instanceof Error) {
+                    LogUtils.error(`Token loading error: ${e.message}`);
+                }
+
                 if (this.settings.oauth2Tokens) {
                     this.settings.oauth2Tokens = undefined;
                     await this.saveSettings();
+                    LogUtils.debug('Cleared invalid OAuth tokens from settings');
                 }
             }
 
@@ -111,13 +140,29 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
                 try {
                     // This will try to refresh if needed
                     await this.authManager.getValidAccessToken();
+                    LogUtils.debug('Mobile token validation successful');
                 } catch (e) {
                     console.error('Token validation failed on mobile, clearing auth state:', e);
+
+                    // Provide more specific logging based on error type
+                    if (e instanceof Error) {
+                        if (e.message.includes('expired')) {
+                            LogUtils.error('Token expired and refresh failed');
+                        } else if (e.message.includes('network')) {
+                            LogUtils.error('Network error during token validation');
+                        } else {
+                            LogUtils.error(`Token validation error: ${e.message}`);
+                        }
+                    }
+
                     isAuthenticated = false;
                     if (this.settings.oauth2Tokens) {
                         this.settings.oauth2Tokens = undefined;
                         await this.saveSettings();
                     }
+
+                    // Notify user about authentication issue
+                    new Notice('Authentication issue detected. Please reconnect to Google Calendar.', 8000);
                 }
             }
 
@@ -207,7 +252,7 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
                                     // Filter out tasks that were just synced
                                     const filteredTasks = tasks.filter(task => {
                                         if (!task.id) return false;
-                                        
+
                                         // Skip recently synced tasks
                                         const metadata = state.plugin.settings.taskMetadata?.[task.id];
                                         if (metadata?.justSynced && metadata.syncTimestamp) {
@@ -217,15 +262,15 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
                                                 return false;
                                             }
                                         }
-                                        
+
                                         // Skip locked tasks
                                         if (state.isTaskLocked(task.id)) {
                                             return false;
                                         }
-                                        
+
                                         return true;
                                     });
-                                    
+
                                     if (filteredTasks.length > 0) {
                                         await state.enqueueTasks(filteredTasks);
                                     }
@@ -269,10 +314,10 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
                         // Get the file content
                         const state = useStore.getState();
                         state.invalidateFileCache(file.path);
-                        
+
                         // Add a small delay to ensure filesystem has the latest content
                         await new Promise(resolve => setTimeout(resolve, 100));
-                        
+
                         const content = await state.getFileContent(file.path);
 
                         // Find all task lines in the file
@@ -294,10 +339,10 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
 
                         // Filter out tasks that were just synced
                         const tasksToQueue = [];
-                        
+
                         for (const task of tasks) {
                             if (!task.id) continue;
-                            
+
                             // Check for just synced tasks and skip them
                             const metadata = state.plugin.settings.taskMetadata?.[task.id];
                             if (metadata?.justSynced && metadata.syncTimestamp) {
@@ -307,13 +352,13 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
                                     continue;
                                 }
                             }
-                            
+
                             // Only queue if not locked
                             if (!state.isTaskLocked(task.id)) {
                                 tasksToQueue.push(task);
                             }
                         }
-                        
+
                         // Enqueue all tasks at once
                         if (tasksToQueue.length > 0) {
                             await state.enqueueTasks(tasksToQueue);
@@ -403,10 +448,10 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
             try {
                 // Force fresh content read with better timing
                 await state.invalidateFileCache(file.path);
-                
+
                 // Add a small delay to ensure filesystem has the latest content
                 await new Promise(resolve => setTimeout(resolve, 100));
-                
+
                 await state.getFileContent(file.path);
             } catch (fileError) {
                 LogUtils.error(`Failed to read file ${file.path} during editor changes:`, fileError);
@@ -439,7 +484,7 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
                                 return; // Skip completely
                             }
                         }
-                    
+
                         LogUtils.debug(`Task ${task.id} has changed, enqueueing for sync`);
 
                         // Process non-locked task immediately
@@ -955,16 +1000,48 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
     }
 
     private isTaskFile(file: TAbstractFile): boolean {
+        // First check if it's a markdown file
         if (!(file instanceof TFile) || !file.extension.toLowerCase().endsWith('md')) {
             return false;
         }
 
-        // Check if file is in included folders
-        if (this.settings.includeFolders.length > 0) {
-            return this.settings.includeFolders.some(folder => file.path.startsWith(folder));
+        // If no included folders specified, all markdown files are task files
+        if (!this.settings.includeFolders || this.settings.includeFolders.length === 0) {
+            return true;
         }
 
-        return true;
+        // Get the include settings
+        const includeSettings = this.settings.includeFolders;
+        
+        // Check for direct file match
+        if (includeSettings.some(path => path === file.path)) {
+            return true;
+        }
+        
+        // Check if file is in included folders with strict matching
+        if (includeSettings.some(folder => {
+            // Skip if this is a direct file reference (likely ends with .md)
+            if (!folder.endsWith('/') && folder.includes('.')) {
+                return false;
+            }
+            return file.path.startsWith(folder + '/');
+        })) {
+            return true;
+        }
+        
+        // Try more lenient matching (without requiring trailing slash)
+        if (includeSettings.some(folder => {
+            // Skip if this is a direct file reference
+            if (!folder.endsWith('/') && folder.includes('.')) {
+                return false;
+            }
+            const folderNoSlash = folder.endsWith('/') ? folder.slice(0, -1) : folder;
+            return file.path.startsWith(folderNoSlash + '/');
+        })) {
+            return true;
+        }
+        
+        return false;
     }
 
     /**

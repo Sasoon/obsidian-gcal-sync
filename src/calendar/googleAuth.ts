@@ -3,6 +3,7 @@ import { loadGoogleCredentials } from '../config/config';
 import type GoogleCalendarSyncPlugin from '../core/main';
 import type { OAuth2Tokens } from '../core/types';
 import { createHash } from 'crypto';
+import { LogUtils } from '../utils/logUtils';
 
 // Define constants for OAuth redirect URIs
 const DESKTOP_PORT = 8085;
@@ -523,61 +524,86 @@ export class GoogleAuthManager {
         this.refreshToken = tokens.refresh_token || this.refreshToken;
         this.tokenExpiry = tokens.expiry_date;
 
-        // Save to plugin settings
+        // Save to plugin settings with additional security measures
         if (this.accessToken && this.refreshToken) {
-            this.plugin.settings.oauth2Tokens = {
-                access_token: this.accessToken,
-                refresh_token: this.refreshToken,
-                expiry_date: this.tokenExpiry || 0,
-                token_type: tokens.token_type,
-                scope: tokens.scope
-            };
-            await this.plugin.saveSettings();
+            try {
+                // Add a timestamp for token age tracking
+                const securedTokens = {
+                    access_token: this.accessToken,
+                    refresh_token: this.refreshToken,
+                    expiry_date: this.tokenExpiry || 0,
+                    token_type: tokens.token_type,
+                    scope: tokens.scope,
+                    stored_at: Date.now(), // Track when the tokens were saved
+                };
+
+                // Store tokens in plugin settings
+                this.plugin.settings.oauth2Tokens = securedTokens as OAuth2Tokens;
+                await this.plugin.saveSettings();
+
+                // Log successful token storage without exposing token values
+                console.log(`Tokens saved successfully. Access token valid until: ${new Date(this.tokenExpiry || 0).toLocaleString()}`);
+                LogUtils.debug('Authentication tokens saved successfully');
+            } catch (error) {
+                console.error('Error saving authentication tokens:', error);
+                LogUtils.error('Failed to save authentication tokens');
+                throw new Error('Failed to securely store authentication tokens');
+            }
         }
     }
 
     async loadSavedTokens(): Promise<boolean> {
         try {
             const tokens = this.plugin.settings.oauth2Tokens;
-            if (tokens?.refresh_token && tokens?.access_token) {
-                console.log('Loading saved tokens from settings');
-                this.refreshToken = tokens.refresh_token;
-                this.accessToken = tokens.access_token;
-                this.tokenExpiry = tokens.expiry_date;
-
-                // Validate token expiry
-                if (this.tokenExpiry && Date.now() >= this.tokenExpiry) {
-                    console.log('Saved token expired, refreshing...');
-                    try {
-                        const newTokens = await this.refreshAccessToken();
-                        return !!newTokens.access_token;
-                    } catch (refreshError) {
-                        console.error('Token refresh failed, clearing tokens:', refreshError);
-                        // If refresh fails, clear the invalid tokens
-                        this.accessToken = null;
-                        this.refreshToken = null;
-                        this.tokenExpiry = null;
-                        this.plugin.settings.oauth2Tokens = undefined;
-                        await this.plugin.saveSettings();
-                        // Force re-authentication
-                        new Notice('Your Google authentication has expired. Please reconnect.');
-                        return false;
-                    }
-                }
-
-                console.log('Successfully loaded saved tokens');
-                return true;
+            if (!tokens?.refresh_token || !tokens?.access_token) {
+                console.log('No saved tokens found');
+                return false;
             }
-            console.log('No saved tokens found');
-            return false;
+
+            console.log('Loading saved tokens from settings');
+
+            // Validate token storage date if available
+            if (tokens.stored_at) {
+                const tokenAge = Date.now() - tokens.stored_at;
+                const maxTokenAge = 90 * 24 * 60 * 60 * 1000; // 90 days in milliseconds
+
+                if (tokenAge > maxTokenAge) {
+                    console.warn('Stored tokens are older than 90 days, requiring re-authentication for security');
+                    LogUtils.warn('Authentication tokens expired (90+ days old), please reconnect');
+                    return false;
+                }
+            }
+
+            this.refreshToken = tokens.refresh_token;
+            this.accessToken = tokens.access_token;
+            this.tokenExpiry = tokens.expiry_date;
+
+            // Validate token expiry and refresh if needed
+            if (this.tokenExpiry && Date.now() >= this.tokenExpiry) {
+                console.log('Saved token expired, refreshing...');
+                try {
+                    const newTokens = await this.refreshAccessToken();
+                    return !!newTokens.access_token;
+                } catch (refreshError) {
+                    console.error('Token refresh failed, clearing tokens:', refreshError);
+
+                    // If refresh fails, clear the invalid tokens
+                    this.accessToken = null;
+                    this.refreshToken = null;
+                    this.tokenExpiry = null;
+                    this.plugin.settings.oauth2Tokens = undefined;
+                    await this.plugin.saveSettings();
+
+                    // Force re-authentication
+                    new Notice('Your Google authentication has expired. Please reconnect.');
+                    return false;
+                }
+            }
+
+            console.log('Successfully loaded saved tokens');
+            return true;
         } catch (error) {
             console.error('Failed to load saved tokens:', error);
-            // Clear any potentially corrupted tokens
-            this.accessToken = null;
-            this.refreshToken = null;
-            this.tokenExpiry = null;
-            this.plugin.settings.oauth2Tokens = undefined;
-            await this.plugin.saveSettings();
             return false;
         }
     }
