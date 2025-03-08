@@ -1,6 +1,6 @@
 {
     "name": "obsidian-gcal-sync",
-    "version": "0.1.0-beta.2",
+    "version": "0.1.0-beta.3",
     "description": "Sync Obsidian tasks with Google Calendar",
     "main": "main.js",
     "scripts": {
