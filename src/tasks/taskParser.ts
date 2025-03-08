@@ -18,32 +18,32 @@ export class TaskId {
 }
 
 export class TaskParser {
-    private readonly DATE_PATTERN = /📅 (\d{4}-\d{2}-\d{2})/;
-    private readonly TIME_PATTERN = /⏰ (\d{1,2}:\d{2})/;
-    private readonly END_TIME_PATTERN = /➡️ (\d{1,2}:\d{2})/;
+    private readonly DATE_PATTERN = /📅\s*(\d{4}-\d{2}-\d{2})/;
+    private readonly TIME_PATTERN = /⏰\s*(\d{1,2}:\d{2})/;
+    private readonly END_TIME_PATTERN = /➡️\s*(\d{1,2}:\d{2})/;
     private readonly REMINDER_PATTERN = /🔔\s*(\d+)([mhd])/;
     private readonly TASK_PATTERN = /^- \[[ xX]\] (.+)/;
-    private readonly COMPLETION_PATTERN = /✅ (\d{4}-\d{2}-\d{2})/;
+    private readonly COMPLETION_PATTERN = /✅\s*(\d{4}-\d{2}-\d{2})/;
     private readonly ID_PATTERN = /<!-- task-id: ([a-z0-9]+) -->/;
 
     constructor(private plugin: GoogleCalendarSyncPlugin) { }
 
     private getFilteredFiles(): TFile[] {
         const allFiles = this.plugin.app.vault.getMarkdownFiles();
-        
+
         // If no include settings, return all files
         if (!this.plugin.settings.includeFolders || this.plugin.settings.includeFolders.length === 0) {
             return allFiles;
         }
-        
+
         // Create result array for matched files
         const matchedFiles: TFile[] = [];
-        
+
         // Process each inclusion path
         for (const includePath of this.plugin.settings.includeFolders) {
             // Check if this is a direct file reference (not ending with /)
             const isLikelyFile = !includePath.endsWith('/') && includePath.includes('.');
-            
+
             if (isLikelyFile) {
                 // Try to get this specific file
                 const exactFile = allFiles.find(file => file.path === includePath);
@@ -52,39 +52,39 @@ export class TaskParser {
                     continue;
                 }
             }
-            
+
             // Handle as folder (strict matching with trailing slash)
-            const folderMatchedFiles = allFiles.filter(file => 
+            const folderMatchedFiles = allFiles.filter(file =>
                 file.path === includePath || file.path.startsWith(includePath + '/')
             );
-            
+
             if (folderMatchedFiles.length > 0) {
                 matchedFiles.push(...folderMatchedFiles);
                 continue;
             }
-            
+
             // Try lenient folder matching (without trailing slash)
             const folderNoSlash = includePath.endsWith('/') ? includePath.slice(0, -1) : includePath;
-            const lenientMatches = allFiles.filter(file => 
+            const lenientMatches = allFiles.filter(file =>
                 file.path === folderNoSlash || file.path.startsWith(folderNoSlash + '/')
             );
-            
+
             if (lenientMatches.length > 0) {
                 matchedFiles.push(...lenientMatches);
             }
         }
-        
+
         // Remove duplicates
         const uniqueFiles = Array.from(new Set(matchedFiles.map(file => file.path)))
             .map(path => allFiles.find(file => file.path === path))
             .filter((file): file is TFile => file !== undefined);
-        
+
         // If no files found after all approaches, use all files with a warning
         if (uniqueFiles.length === 0) {
             LogUtils.warn(`No files match folder inclusion settings. Using all files as fallback. Check your settings.`);
             return allFiles;
         }
-        
+
         return uniqueFiles;
     }
 
@@ -301,12 +301,12 @@ export class TaskParser {
                             // Get current version and increment it
                             const currentVersion = metadata.version || 0;
                             const newVersion = currentVersion + 1;
-                            
+
                             // Generate an operation ID for better tracing
                             const opId = `${id.substring(0, 4)}-${newVersion}-${Math.random().toString(36).substring(2, 5)}`;
-                            
+
                             LogUtils.debug(`Updating task metadata for ${id} (op:${opId}) to version ${newVersion}`);
-                            
+
                             const updatedMetadata = {
                                 ...metadata,
                                 title: task.title,
@@ -433,26 +433,32 @@ export class TaskParser {
 
     private hasTaskChanged(task: Task, metadata: TaskMetadata): boolean {
         const result = hasTaskChanged(task, metadata, task.id);
-        
+
         // Additional logging for task parser verbose mode
         if (result.changed && this.plugin.settings.verboseLogging) {
             if (result.changes?.title) {
                 LogUtils.debug(`Title changed: "${metadata?.title}" → "${task.title}"`);
             }
         }
-        
+
         return result.changed;
     }
 
     public async createTask(task: Task) {
         try {
-            // Keep the task formatting consistent but don't enforce any specific order of components
-            // This allows the user to see the format but the parser will still work with any order
-            const taskContent = `${task.title}` +
+            // Reorder components to put reminder at the beginning
+            let taskContent = "";
+
+            // Add reminder at the beginning if present
+            if (task.reminder) {
+                taskContent = `🔔 ${task.reminder}m `;
+            }
+
+            // Add title and other components with proper spacing
+            taskContent += `${task.title}` +
                 (task.date ? ` 📅 ${task.date}` : '') +
                 (task.time ? ` ⏰ ${task.time}` : '') +
-                (task.endTime ? ` ➡️ ${task.endTime}` : '') +
-                (task.reminder ? ` 🔔 ${task.reminder}m` : '');
+                (task.endTime ? ` ➡️ ${task.endTime}` : '');
 
             // Format task with proper indentation for multi-line content
             const formattedTaskLine = task.title.includes('\n')
@@ -725,10 +731,10 @@ export class TaskParser {
                 // Force cache invalidation before reading
                 const state = useStore.getState();
                 state.invalidateFileCache(metadata.filePath);
-                
+
                 // Add a small delay to ensure filesystem has the latest content
                 await new Promise(resolve => setTimeout(resolve, 50));
-                
+
                 // Get file by path
                 const file = this.plugin.app.vault.getAbstractFileByPath(metadata.filePath);
                 if (file instanceof TFile) {
@@ -752,7 +758,7 @@ export class TaskParser {
                 // Force cache invalidation for each file
                 const state = useStore.getState();
                 state.invalidateFileCache(file.path);
-                
+
                 const tasks = await this.parseTasksFromFile(file);
                 const task = tasks.find(t => t.id === taskId);
                 if (task) {

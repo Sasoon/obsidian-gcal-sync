@@ -133,8 +133,10 @@ export class MetadataManager {
             for (const file of allFiles) {
                 const content = await this.plugin.app.vault.read(file);
                 const matches = Array.from(content.matchAll(/<!-- task-id: ([a-z0-9]+) -->/g));
-                const taskStates = new Map(Array.from(content.matchAll(/- \[([ xX])\].*?<!-- task-id: ([a-z0-9]+) -->/g))
-                    .map(match => [match[2], match[1].toLowerCase() === 'x']));
+
+                // Updated regex to match IDs at the beginning of tasks after the checkbox
+                const taskStates = new Map(Array.from(content.matchAll(/- \[([ xX])\] (?:<!-- task-id: ([a-z0-9]+) -->|.*?<!-- task-id: ([a-z0-9]+) -->)/g))
+                    .map(match => [match[2] || match[3], match[1].toLowerCase() === 'x']));
 
                 for (const match of matches) {
                     const taskId = match[1];

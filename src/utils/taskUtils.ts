@@ -11,7 +11,7 @@ import { LogUtils } from './logUtils';
  * @param taskId Optional task ID for logging
  * @returns Boolean indicating if the task has changed and an object detailing what changed
  */
-export function hasTaskChanged(task: Task, metadata?: TaskMetadata, taskId?: string): { 
+export function hasTaskChanged(task: Task, metadata?: TaskMetadata, taskId?: string): {
     changed: boolean;
     changes?: {
         title: boolean;
@@ -39,7 +39,7 @@ export function hasTaskChanged(task: Task, metadata?: TaskMetadata, taskId?: str
 
     // Always consider completed tasks as changed to ensure they get synced
     if (task.completed) {
-        return { 
+        return {
             changed: true,
             changes: {
                 title: false,
@@ -69,7 +69,7 @@ export function hasTaskChanged(task: Task, metadata?: TaskMetadata, taskId?: str
     };
 
     const hasChanged = Object.values(changes).some(change => change);
-    
+
     if (hasChanged && taskId) {
         LogUtils.debug(`Task ${taskId} changed: ${JSON.stringify(changes)}`);
     }

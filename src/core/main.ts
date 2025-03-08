@@ -1012,12 +1012,12 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
 
         // Get the include settings
         const includeSettings = this.settings.includeFolders;
-        
+
         // Check for direct file match
         if (includeSettings.some(path => path === file.path)) {
             return true;
         }
-        
+
         // Check if file is in included folders with strict matching
         if (includeSettings.some(folder => {
             // Skip if this is a direct file reference (likely ends with .md)
@@ -1028,7 +1028,7 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
         })) {
             return true;
         }
-        
+
         // Try more lenient matching (without requiring trailing slash)
         if (includeSettings.some(folder => {
             // Skip if this is a direct file reference
@@ -1040,7 +1040,7 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
         })) {
             return true;
         }
-        
+
         return false;
     }
 
