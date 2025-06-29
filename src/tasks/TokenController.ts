@@ -44,11 +44,11 @@ export class TokenController {
     }
 
     private registerEditorHandlers() {
-        // Track edits and ensure IDs stay at beginning of lines after checkbox
+        // Track edits and ensure IDs stay at end of lines
         this.plugin.registerEvent(
             this.plugin.app.workspace.on('editor-change', debounce((editor: Editor) => {
                 this.lastEditTime = Date.now()
-                this.ensureIdsAtBeginningOfLines(editor)
+                this.ensureIdsAtEndOfLines(editor)
                 this.checkForNewTasks(editor)
                 this.handleTaskCompletionChanges(editor)
             }, 1000))
@@ -139,7 +139,7 @@ export class TokenController {
                     // Clean up any extra whitespace
                     newLine = newLine.replace(/\s+/g, ' ').trim()
 
-                    // Ensure ID and reminder are at the beginning of the line after the checkbox
+                    // Ensure ID is at the end and reminder is at the beginning after checkbox
                     // Remove the ID and reminder first
                     if (taskId) {
                         newLine = newLine.replace(this.ID_PATTERN, '')
@@ -149,24 +149,18 @@ export class TokenController {
                     }
                     newLine = newLine.trim()
 
-                    // Find the position after the checkbox
+                    // Find the position after the checkbox for reminder
                     const checkboxMatch = newLine.match(/^(\s*- \[[ xX]\] )/)
                     if (checkboxMatch) {
-                        // Build the beginning of the task with checkbox, ID, and reminder
-                        let beginning = checkboxMatch[0]
-
-                        // Add ID after checkbox
-                        if (taskId) {
-                            beginning += `<!-- task-id: ${taskId} --> `
-                        }
-
-                        // Add reminder after ID
+                        // Add reminder after checkbox
                         if (reminderText) {
-                            beginning += `${reminderText} `
+                            newLine = newLine.replace(checkboxMatch[0], checkboxMatch[0] + `${reminderText} `)
                         }
 
-                        // Replace the checkbox with our new beginning
-                        newLine = newLine.replace(checkboxMatch[0], beginning)
+                        // Add ID at the end
+                        if (taskId) {
+                            newLine = newLine + ` <!-- task-id: ${taskId} -->`
+                        }
                     }
 
                     LogUtils.debug(`Cleaning up completion markers in unticked task: ${taskId}`)
@@ -202,7 +196,7 @@ export class TokenController {
         }
     }
 
-    private ensureIdsAtBeginningOfLines(editor: Editor) {
+    private ensureIdsAtEndOfLines(editor: Editor) {
         // @ts-ignore - cm exists on editor but is not typed
         const view = editor.cm as EditorView
         if (!view) return
@@ -218,11 +212,49 @@ export class TokenController {
             // Also look for reminders
             const reminderMatch = line.text.match(/🔔\s*(\d+)([mhd])/)
 
+            // Handle task IDs that might be on wrong lines after line breaks
+            if (taskIdMatches.length > 0 && !line.text.match(/^.*?- \[[ x]\].*/)) {
+                // Found a task ID on a non-task line - move it to the previous task line
+                const taskId = taskIdMatches[0][0]
+                LogUtils.debug(`Found orphaned task ID on line ${i}: ${taskId}`)
+                
+                // Look for the previous task line
+                if (i > 1) {
+                    const prevLine = doc.line(i - 1)
+                    if (prevLine.text.match(/^.*?- \[[ x]\].*/) && !prevLine.text.match(this.ID_PATTERN)) {
+                        // Previous line is a task without an ID - move the ID there
+                        changes.push({
+                            from: prevLine.from,
+                            to: prevLine.to,
+                            insert: prevLine.text.trim() + ' ' + taskId
+                        })
+                        
+                        // Remove the ID from current line
+                        const cleanedLine = line.text.replace(this.ID_PATTERN, '').trim()
+                        if (cleanedLine) {
+                            changes.push({
+                                from: line.from,
+                                to: line.to,
+                                insert: cleanedLine
+                            })
+                        } else {
+                            // Line is empty after removing ID, remove the entire line
+                            changes.push({
+                                from: line.from - (i > 1 ? 1 : 0), // Include preceding newline if not first line
+                                to: line.to,
+                                insert: ''
+                            })
+                        }
+                        continue
+                    }
+                }
+            }
+
             if (line.text.match(/^.*?- \[[ x]\].*/)) {
                 let needsUpdate = false
                 let newLine = line.text
 
-                // Handle IDs first
+                // Handle IDs first - ensure they're at the end
                 if (taskIdMatches.length > 0) {
                     // Check if there are multiple IDs (the issue)
                     if (taskIdMatches.length > 1) {
@@ -235,67 +267,51 @@ export class TokenController {
                         // Clean up any extra whitespace
                         newLine = newLine.replace(/\s+/g, ' ').trim()
 
-                        // Find the position after the checkbox
-                        const checkboxMatch = newLine.match(/^(\s*- \[[ xX]\] )/)
-                        if (checkboxMatch) {
-                            // Insert the ID after the checkbox
-                            newLine = newLine.replace(checkboxMatch[0], checkboxMatch[0] + firstId + ' ')
-                            needsUpdate = true
-                        }
+                        // Add the ID at the end of the line
+                        newLine = newLine + ' ' + firstId
+                        needsUpdate = true
                     }
-                    // If ID exists but is not at the beginning of the line after the checkbox
+                    // If ID exists but is not at the end of the line
                     else {
                         const idMatch = taskIdMatches[0]
-                        const idIndex = idMatch.index
                         const idText = idMatch[0]
-
-                        // Find the position after the checkbox
-                        const checkboxMatch = line.text.match(/^(\s*- \[[ xX]\] )/)
-                        if (!checkboxMatch) continue;
-
-                        const checkboxEndIndex = checkboxMatch[0].length;
-
-                        // Only move if the ID is not already at the beginning after the checkbox
-                        if (idIndex !== undefined && idIndex !== line.from + checkboxEndIndex) {
+                        
+                        // Check if ID is already at the end (with optional whitespace)
+                        const isAtEnd = newLine.trim().endsWith(idText.trim())
+                        
+                        if (!isAtEnd) {
                             // Remove the ID from its current position
                             newLine = newLine.replace(idText, '')
                             // Clean up any extra whitespace
                             newLine = newLine.replace(/\s+/g, ' ').trim()
 
-                            // Insert the ID after the checkbox
-                            const newCheckboxMatch = newLine.match(/^(\s*- \[[ xX]\] )/)
-                            if (newCheckboxMatch) {
-                                newLine = newLine.replace(newCheckboxMatch[0], newCheckboxMatch[0] + idText + ' ')
-                                needsUpdate = true
-                            }
+                            // Add the ID at the end of the line
+                            newLine = newLine + ' ' + idText
+                            needsUpdate = true
                         }
                     }
                 }
 
-                // Now handle reminders - move them to the beginning after the ID
+                // Handle reminders - keep them near the beginning after the checkbox
                 if (reminderMatch) {
-                    // Only process if the reminder is not already at the beginning
                     const reminderText = reminderMatch[0]
                     const reminderIndex = newLine.indexOf(reminderText)
 
-                    // Find the position after the checkbox and ID
-                    const checkboxAndIdMatch = newLine.match(/^(\s*- \[[ xX]\] )(<!-- task-id: [a-z0-9]+ --> )?/)
-                    if (checkboxAndIdMatch) {
-                        const insertPos = checkboxAndIdMatch[0].length
+                    // Find the position after the checkbox
+                    const checkboxMatch = newLine.match(/^(\s*- \[[ xX]\] )/)
+                    if (checkboxMatch) {
+                        const insertPos = checkboxMatch[0].length
 
-                        // Only move if the reminder is not already at the beginning after the ID
-                        if (reminderIndex > insertPos) {
+                        // Only move if the reminder is not already near the beginning
+                        if (reminderIndex > insertPos + 10) { // Allow some flexibility
                             // Remove the reminder from its current position
                             newLine = newLine.replace(reminderText, '')
                             // Clean up any extra whitespace
                             newLine = newLine.replace(/\s+/g, ' ').trim()
 
-                            // Insert the reminder after the ID (or after the checkbox if no ID)
-                            const newCheckboxAndIdMatch = newLine.match(/^(\s*- \[[ xX]\] )(<!-- task-id: [a-z0-9]+ --> )?/)
-                            if (newCheckboxAndIdMatch) {
-                                newLine = newLine.replace(newCheckboxAndIdMatch[0], newCheckboxAndIdMatch[0] + reminderText + ' ')
-                                needsUpdate = true
-                            }
+                            // Insert the reminder after the checkbox
+                            newLine = newLine.replace(checkboxMatch[0], checkboxMatch[0] + reminderText + ' ')
+                            needsUpdate = true
                         }
                     }
                 }
@@ -315,24 +331,20 @@ export class TokenController {
                         // Clean up any extra whitespace
                         newLine = newLine.replace(/\s+/g, ' ').trim()
 
-                        // Remove the ID
+                        // Remove the ID temporarily
                         newLine = newLine.replace(this.ID_PATTERN, '').trim()
 
-                        // Find the position after the checkbox
-                        const checkboxMatch = newLine.match(/^(\s*- \[[ xX]\] )/)
-                        if (checkboxMatch) {
-                            // Insert the ID after the checkbox
-                            if (taskId) {
-                                const taskIdText = `<!-- task-id: ${taskId} -->`
-                                newLine = newLine.replace(checkboxMatch[0], checkboxMatch[0] + taskIdText + ' ')
-                            }
-
-                            LogUtils.debug(`Cleaning up completion markers in unticked task during ID check: ${taskId}`)
-                            LogUtils.debug(`Original line: ${line.text}`)
-                            LogUtils.debug(`Updated line: ${newLine}`)
-
-                            needsUpdate = true
+                        // Add the ID back at the end
+                        if (taskId) {
+                            const taskIdText = `<!-- task-id: ${taskId} -->`
+                            newLine = newLine + ' ' + taskIdText
                         }
+
+                        LogUtils.debug(`Cleaning up completion markers in unticked task during ID check: ${taskId}`)
+                        LogUtils.debug(`Original line: ${line.text}`)
+                        LogUtils.debug(`Updated line: ${newLine}`)
+
+                        needsUpdate = true
                     }
                 }
 
@@ -439,29 +451,23 @@ export class TokenController {
                             // Clean up extra whitespace
                             cleanedLine = cleanedLine.replace(/\s+/g, ' ').trim();
 
-                            // Ensure the ID and reminder are at the beginning after the checkbox
+                            // Ensure the ID is at the end and reminder is at the beginning after checkbox
                             // Remove the ID and reminder
                             cleanedLine = cleanedLine.replace(controller.ID_PATTERN, '').trim();
                             if (reminderText) {
                                 cleanedLine = cleanedLine.replace(reminderText, '').trim();
                             }
 
-                            // Find the position after the checkbox
+                            // Find the position after the checkbox for reminder
                             const checkboxMatch = cleanedLine.match(/^(\s*- \[[ xX]\] )/);
                             if (checkboxMatch) {
-                                // Build the beginning of the task with checkbox, ID, and reminder
-                                let beginning = checkboxMatch[0];
-
-                                // Add ID after checkbox
-                                beginning += taskIdMatch[0] + ' ';
-
-                                // Add reminder after ID
+                                // Add reminder after checkbox
                                 if (reminderText) {
-                                    beginning += reminderText + ' ';
+                                    cleanedLine = cleanedLine.replace(checkboxMatch[0], checkboxMatch[0] + reminderText + ' ');
                                 }
 
-                                // Replace the checkbox with our new beginning
-                                cleanedLine = cleanedLine.replace(checkboxMatch[0], beginning);
+                                // Add ID at the end
+                                cleanedLine = cleanedLine + ' ' + taskIdMatch[0];
                             }
 
                             LogUtils.debug(`Original line: ${newLineText}`);
@@ -649,21 +655,11 @@ export class TokenController {
                             return;
                         }
 
-                        // If breaking before the ID, move it to stay with the task header
-                        if (changeIndex < idIndex) {
-                            const beforeBreak = line.text.slice(0, fromA - line.from + 1);
-                            const afterBreak = line.text.slice(fromA - line.from + 1, idIndex).trimLeft();
-                            const id = taskMatch[1];
-                            const restContent = line.text.slice(idIndex + taskMatch[1].length);
+                        // For line breaks within task content, let CodeMirror handle naturally
+                        // We'll fix the ID position in a post-processing step via the ensureIdsAtEndOfLines method
+                        // This prevents the character duplication bug caused by conflicting transaction handling
 
-                            changes.push({
-                                from: line.from,
-                                to: line.to,
-                                insert: beforeBreak + id + '\n' + afterBreak + restContent
-                            });
-                        }
-
-                        // Always allow the line break to proceed
+                        // Always allow the line break to proceed naturally
                         return;
                     }
 
@@ -789,24 +785,18 @@ export class TokenController {
             // Create the task ID
             const taskId = `<!-- task-id: ${id} -->`;
 
-            // Insert the ID at the beginning of the task after the checkbox
-            // This helps with Tasks plugin compatibility
+            // Insert the ID at the end of the line
+            // This helps with tag parsing and general readability
             let transaction;
 
-            // Find the position right after the checkbox
-            const checkboxMatch = line.text.match(/^(\s*- \[[ xX]\] )/);
-            if (!checkboxMatch) {
-                LogUtils.error('Could not find checkbox pattern');
-                return '';
-            }
+            // Find the end of the line
+            const insertPos = line.to;
 
-            const insertPos = line.from + checkboxMatch[0].length;
-
-            // Insert the ID at the beginning of the task content
+            // Insert the ID at the end of the task line
             const changes = [{
                 from: insertPos,
                 to: insertPos,
-                insert: `${taskId} `
+                insert: ` ${taskId}`
             }];
 
             transaction = view.state.update({ changes });

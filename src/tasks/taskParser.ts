@@ -567,6 +567,9 @@ export class TaskParser {
         // Remove the ID with better spacing handling
         header = header.replace(/<!--\s*task-id:\s*[a-z0-9]+\s*-->/, '').trim();
 
+        // Remove hashtags/tags (e.g., #movie, #work, etc.)
+        header = header.replace(/#\w+/g, '').trim();
+
         // Clean up any double spaces that might have been created
         header = header.replace(/\s{2,}/g, ' ').trim();
 
@@ -724,7 +727,27 @@ export class TaskParser {
     }
 
     public async getTaskById(taskId: string): Promise<Task | null> {
-        // First try using metadata to locate the file directly (more efficient)
+        // First check the currently active file in the editor (handles unsaved changes)
+        const activeFile = this.plugin.app.workspace.getActiveFile();
+        if (activeFile instanceof TFile) {
+            const activeView = this.plugin.app.workspace.getActiveViewOfType(MarkdownView);
+            if (activeView?.editor) {
+                try {
+                    // Parse tasks from current editor content (unsaved changes)
+                    const editorContent = activeView.editor.getValue();
+                    const tasks = await this.parseTasksFromContent(editorContent, activeFile.path);
+                    const task = tasks.find(t => t.id === taskId);
+                    if (task) {
+                        LogUtils.debug(`Found task ${taskId} in current editor`);
+                        return task;
+                    }
+                } catch (error) {
+                    LogUtils.debug(`Failed to parse current editor content for task ${taskId}:`, error);
+                }
+            }
+        }
+
+        // Then try using metadata to locate the file directly (more efficient)
         const metadata = this.plugin.settings.taskMetadata[taskId];
         if (metadata?.filePath) {
             try {
