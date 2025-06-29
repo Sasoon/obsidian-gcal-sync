@@ -567,8 +567,27 @@ export class TaskParser {
         // Remove the ID with better spacing handling
         header = header.replace(/<!--\s*task-id:\s*[a-z0-9]+\s*-->/, '').trim();
 
-        // Remove hashtags/tags (e.g., #movie, #work, etc.)
-        header = header.replace(/#\w+/g, '').trim();
+        // Remove hashtags/tags (including those with numbers like #1a1a1a)
+        header = header.replace(/#[a-zA-Z0-9_]+/g, '').trim();
+
+        // Remove Obsidian Tasks plugin emojis and their associated values
+        // Start date: 🛫 YYYY-MM-DD  
+        header = header.replace(/🛫\s*\d{4}-\d{2}-\d{2}/g, '').trim();
+        // Scheduled date: ⏳ YYYY-MM-DD
+        header = header.replace(/⏳\s*\d{4}-\d{2}-\d{2}/g, '').trim();
+        // Recurrence: 🔁 (followed by recurrence pattern)
+        header = header.replace(/🔁\s*[^\s]*/g, '').trim();
+        // Date: 📅 (followed by date)
+        header = header.replace(/📅\s*[^\s]*/g, '').trim();
+        // Priority emojis (no additional text needed)
+        header = header.replace(/[⏫🔼🔽🔺⏬]/g, '').trim();
+        // Other task property emojis (may have text after them) 
+        // This pattern matches: emoji + optional space + any non-whitespace characters
+        header = header.replace(/🆔\s*[^\s]+/g, '').trim();
+        header = header.replace(/[⛔❌➕⏩]\s*[^\s]+/g, '').trim();
+        
+        // Remove standalone dates that weren't caught by emoji patterns
+        header = header.replace(/\b\d{4}-\d{2}-\d{2}\b/g, '').trim();
 
         // Clean up any double spaces that might have been created
         header = header.replace(/\s{2,}/g, ' ').trim();
