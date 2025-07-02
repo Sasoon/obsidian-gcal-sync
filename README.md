@@ -54,7 +54,8 @@ Desktop authenticates using your local server, however mobile does not support t
 ### Date and Time Formats
 The plugin recognizes these date formats in your tasks:
 - `📅 YYYY-MM-DD` - Task date without time
-- `⏰ HH:MM` - Task time
+- `⏰ HH:MM` - Start time
+- `➡️ 15:30` - End time
 - `📅 YYYY-MM-DD ⏰ HH:MM` - Task date with time
 - `⏳ YYYY-MM-DD` - Start date for tasks with a duration
 
