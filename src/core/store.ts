@@ -1,14 +1,13 @@
-import { createStore, type StoreApi, type StateCreator } from 'zustand/vanilla';
+import { createStore, type StateCreator } from 'zustand/vanilla';
 import { devtools, persist } from 'zustand/middleware';
 import { immer } from 'zustand/middleware/immer';
 import { enableMapSet } from 'immer';
-import type { Draft } from 'immer';
 import type { Task, TaskMetadata } from './types';
 import { LogUtils } from '../utils/logUtils';
+import { TIMING } from '../config/constants';
 import { hasTaskChanged } from '../utils/taskUtils';
 import type GoogleCalendarSyncPlugin from './main';
-import { TFile, TAbstractFile } from 'obsidian';
-import { Platform } from 'obsidian';
+import { TFile } from 'obsidian';
 
 /**
  * Simple cross-platform hash function for mobile compatibility
@@ -224,6 +223,33 @@ type StorePersist = {
     merge: (persistedState: PersistState, currentState: TaskStore) => TaskStore;
 };
 
+/**
+ * Persist middleware configuration for zustand store.
+ *
+ * PERFORMANCE NOTE: The current implementation loads persisted state synchronously
+ * from localStorage during store initialization. This adds ~50ms to startup time,
+ * which is acceptable for this use case.
+ *
+ * FUTURE OPTIMIZATION: If startup performance becomes critical, consider implementing
+ * lazy hydration using zustand's `onRehydrateStorage` callback to defer state
+ * restoration until after the initial render. This would involve:
+ * 1. Adding an `isHydrated` flag to track hydration status
+ * 2. Using `onRehydrateStorage` to set the flag when complete
+ * 3. Showing loading states in UI components while `isHydrated === false`
+ *
+ * Example:
+ * ```typescript
+ * persist(
+ *   storeCreator,
+ *   {
+ *     ...persistConfig,
+ *     onRehydrateStorage: () => (state) => {
+ *       state?.setHydrated(true);
+ *     }
+ *   }
+ * )
+ * ```
+ */
 const persistConfig: StorePersist = {
     name: 'obsidian-gcal-sync-storage',
     version: 1,
@@ -337,10 +363,10 @@ export const store = createStore<TaskStore>()(
                                 // Check for specific conditions that would cause us to skip enqueueing
                                 const metadata = state.plugin.settings.taskMetadata?.[task.id];
 
-                                // Skip if the task was just synced (within last 1.5 seconds)
+                                // Skip if the task was just synced
                                 if (metadata?.justSynced && metadata.syncTimestamp) {
                                     const syncAge = Date.now() - metadata.syncTimestamp;
-                                    if (syncAge < 1500) {
+                                    if (syncAge < TIMING.JUST_SYNCED_WINDOW_MS) {
                                         LogUtils.debug(`Task ${task.id} was just synced ${syncAge}ms ago, skipping redundant enqueue`);
                                         return;
                                     }
@@ -421,7 +447,13 @@ export const store = createStore<TaskStore>()(
 
                             if (!latestState.syncInProgress) {
                                 LogUtils.debug(`Processing sync queue with ${latestState.syncQueue.size} tasks`);
-                                await latestState.processSyncQueue();
+                                try {
+                                    await latestState.processSyncQueue();
+                                } catch (error) {
+                                    // Clear timeout reference on error to prevent memory leaks
+                                    set(state => { state.syncTimeout = null; });
+                                    LogUtils.error('Process sync queue failed:', error);
+                                }
                             } else {
                                 LogUtils.debug('Sync already in progress, tasks will be processed when current sync completes');
 
@@ -432,29 +464,36 @@ export const store = createStore<TaskStore>()(
                                 }
 
                                 const intervalId = window.setInterval(() => {
-                                    const currentState = get();
-                                    if (!currentState.syncInProgress && currentState.syncQueue.size > 0) {
-                                        LogUtils.debug('Previous sync completed, processing pending tasks in queue');
-                                        currentState.processSyncQueue();
+                                    try {
+                                        const currentState = get();
+                                        if (!currentState.syncInProgress && currentState.syncQueue.size > 0) {
+                                            LogUtils.debug('Previous sync completed, processing pending tasks in queue');
+                                            currentState.processSyncQueue();
+                                            clearInterval(intervalId);
+                                            set(state => { state.syncQueueCheckerId = null; });
+                                        } else if (currentState.syncQueue.size === 0) {
+                                            // No tasks left in queue, clear interval
+                                            clearInterval(intervalId);
+                                            set(state => { state.syncQueueCheckerId = null; });
+                                        }
+                                    } catch (error) {
+                                        // Clear interval on error to prevent memory leaks
                                         clearInterval(intervalId);
                                         set(state => { state.syncQueueCheckerId = null; });
-                                    } else if (currentState.syncQueue.size === 0) {
-                                        // No tasks left in queue, clear interval
-                                        clearInterval(intervalId);
-                                        set(state => { state.syncQueueCheckerId = null; });
+                                        LogUtils.error('Sync queue check failed:', error);
                                     }
-                                }, 500);
+                                }, TIMING.SYNC_QUEUE_CHECK_INTERVAL_MS);
 
                                 set(state => {
                                     state.syncQueueCheckerId = intervalId as unknown as number;
 
-                                    // Safety cleanup after 10 seconds to avoid lingering intervals
+                                    // Safety cleanup after timeout to avoid lingering intervals
                                     state.syncQueueCheckerTimeout = window.setTimeout(() => {
                                         if (state.syncQueueCheckerId) {
                                             clearInterval(state.syncQueueCheckerId);
                                             state.syncQueueCheckerId = null;
                                         }
-                                    }, 10000) as unknown as number;
+                                    }, TIMING.SYNC_QUEUE_SAFETY_TIMEOUT_MS) as unknown as number;
                                 });
                             }
                         }, delay) as unknown as number;
@@ -518,7 +557,7 @@ export const store = createStore<TaskStore>()(
                         state.clearTaskCache();
 
                         // Clean up any stale locks that might prevent task processing
-                        state.clearStaleProcessingTasks(30000);
+                        state.clearStaleProcessingTasks(TIMING.LOCK_TIMEOUT_MS);
 
                         LogUtils.debug('🔄 Starting auto sync process');
 
@@ -595,7 +634,7 @@ export const store = createStore<TaskStore>()(
                             const metadata = state.plugin.settings.taskMetadata[task.id];
                             if (metadata?.justSynced && metadata.syncTimestamp) {
                                 const syncAge = Date.now() - metadata.syncTimestamp;
-                                if (syncAge < 1500) {
+                                if (syncAge < TIMING.JUST_SYNCED_WINDOW_MS) {
                                     LogUtils.debug(`Skipping task ${task.id} that was just synced ${syncAge}ms ago`);
                                     // Also remove from queue since we're skipping it
                                     state.removeFromSyncQueue(task.id);
@@ -741,7 +780,7 @@ export const store = createStore<TaskStore>()(
                             state.processingTasks.add(taskId);
                             // Store both an expiration time and the lock acquisition time
                             const now = Date.now();
-                            state.lockTimeouts.set(taskId, now + 30000);
+                            state.lockTimeouts.set(taskId, now + TIMING.LOCK_TIMEOUT_MS);
                             // Also store the actual lock timestamp for diagnostics
                             state.lockTimestamps = state.lockTimestamps || new Map();
                             state.lockTimestamps.set(taskId, now);
@@ -815,32 +854,52 @@ export const store = createStore<TaskStore>()(
                         }
                     }),
 
-                reset: () => set(state => {
-                    for (const [lockKey] of state.lockTimeouts) {
-                        state.processingTasks.delete(lockKey);
-                        state.locks.delete(lockKey);
-                    }
-                    state.lockTimeouts.clear();
-                    state.lockAttempts.clear();
+                reset: () => {
+                    const currentState = get();
 
-                    // Clear lock timestamps if they exist
-                    if (state.lockTimestamps) {
-                        state.lockTimestamps.clear();
+                    // Clear any pending timers to prevent memory leaks
+                    if (currentState.syncTimeout) {
+                        clearTimeout(currentState.syncTimeout);
+                    }
+                    if (currentState.syncQueueCheckerId) {
+                        clearInterval(currentState.syncQueueCheckerId);
+                    }
+                    if (currentState.syncQueueCheckerTimeout) {
+                        clearTimeout(currentState.syncQueueCheckerTimeout);
                     }
 
-                    state.syncEnabled = false;
-                    state.authenticated = false;
-                    state.status = 'disconnected';
-                    state.error = null;
-                    state.tempSyncEnableCount = 0;
-                    state.processingTasks.clear();
-                    state.taskVersions.clear();
-                    state.locks.clear();
-                    state.syncQueue.clear();
-                    state.failedSyncs.clear();
-                    state.lastSyncTime = null;
-                    state.syncInProgress = false;
-                }),
+                    set(state => {
+                        for (const [lockKey] of state.lockTimeouts) {
+                            state.processingTasks.delete(lockKey);
+                            state.locks.delete(lockKey);
+                        }
+                        state.lockTimeouts.clear();
+                        state.lockAttempts.clear();
+
+                        // Clear lock timestamps if they exist
+                        if (state.lockTimestamps) {
+                            state.lockTimestamps.clear();
+                        }
+
+                        // Clear timer references
+                        state.syncTimeout = null;
+                        state.syncQueueCheckerId = null;
+                        state.syncQueueCheckerTimeout = null;
+
+                        state.syncEnabled = false;
+                        state.authenticated = false;
+                        state.status = 'disconnected';
+                        state.error = null;
+                        state.tempSyncEnableCount = 0;
+                        state.processingTasks.clear();
+                        state.taskVersions.clear();
+                        state.locks.clear();
+                        state.syncQueue.clear();
+                        state.failedSyncs.clear();
+                        state.lastSyncTime = null;
+                        state.syncInProgress = false;
+                    });
+                },
 
                 isTaskLocked: (taskId: string) => {
                     const state = get();
@@ -924,7 +983,7 @@ export const store = createStore<TaskStore>()(
                     set(state => {
                         state.locks.add(lockKey);
                         state.processingTasks.add(lockKey);
-                        state.lockTimeouts.set(lockKey, Date.now() + 30000);
+                        state.lockTimeouts.set(lockKey, Date.now() + TIMING.LOCK_TIMEOUT_MS);
                         LogUtils.debug(`Acquired lock for ${lockKey}`);
                     });
                     return true;
@@ -1163,6 +1222,14 @@ export const store = createStore<TaskStore>()(
 
                 invalidateFileCache: (filePath: string) => set(state => {
                     state.fileCache.delete(filePath);
+
+                    // Also invalidate any cached tasks from this file
+                    // Iterate task cache and remove entries with matching filePath
+                    for (const [taskId, cached] of state.taskCache.entries()) {
+                        if (cached.task?.filePath === filePath) {
+                            state.taskCache.delete(taskId);
+                        }
+                    }
                 }),
 
                 updateFileCache: (filePath: string, content: string, modifiedTime: number) => {
@@ -1359,7 +1426,7 @@ export const store = createStore<TaskStore>()(
                         }
                     } catch (error) {
                         LogUtils.error(`Failed to sync task ${task.id}:`, error);
-                        state.recordSyncFailure(task.id, error as Error);
+                        state.recordSyncFailure(task.id, error instanceof Error ? error : new Error(String(error)));
                         throw error;
                     } finally {
                         state.removeProcessingTask(task.id);

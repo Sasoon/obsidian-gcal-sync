@@ -1,4 +1,4 @@
-import { Plugin, Notice, Menu, MenuItem, Editor, TFile, TAbstractFile, MarkdownView, Modal, App } from 'obsidian';
+import { Plugin, Notice, Menu, MenuItem, Editor, TFile, TAbstractFile, MarkdownView } from 'obsidian';
 import { GoogleAuthManager } from '../calendar/googleAuth';
 import { TaskParser } from '../tasks/taskParser';
 import { CalendarSync } from '../calendar/calendarSync';
@@ -6,14 +6,11 @@ import { RepairManager } from '../repair/repairManager';
 import { GoogleCalendarSettingsTab, DEFAULT_SETTINGS } from './settings';
 import type { GoogleCalendarSettings, Task } from './types';
 import { loadGoogleCredentials } from '../config/config';
-import { useStore, store, type TaskStore } from './store';
+import { TIMING } from '../config/constants';
+import { useStore, type TaskStore } from './store';
 import debounce from 'just-debounce-it';
 import { MetadataManager } from '../metadata/metadataManager';
 import { TokenController } from '../tasks/TokenController';
-import { EditorView } from '@codemirror/view';
-// Import dotenv for environment variables
-import * as dotenv from 'dotenv';
-// Removed UUID dependency for mobile compatibility
 import { LogUtils } from '../utils/logUtils';
 import { hasTaskChanged } from '../utils/taskUtils';
 import { initializeStore } from './store';
@@ -44,11 +41,15 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
             this.settings.clientId = credentials.clientId;
 
             // Always disable welcome modal
+            // Note: saveSettings() removed here - settings will be saved later when needed
             this.settings.hasCompletedOnboarding = true;
-            await this.saveSettings();
 
             // Initialize LogUtils
             LogUtils.initialize(this);
+
+            // Initialize store with plugin instance early so it's ready for any state updates
+            // This must happen before auth operations that may need to update store state
+            initializeStore(this);
 
             // Initialize TaskParser first
             this.taskParser = new TaskParser(this);
@@ -57,7 +58,8 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
             this.authManager = new GoogleAuthManager(this);
 
             // Make sure any previous protocol handlers are cleaned up first
-            await this.authManager.cleanup();
+            // Don't await - let cleanup happen in background to avoid blocking startup
+            this.authManager.cleanup();
 
             // Register protocol handler for mobile OAuth
             this.registerObsidianProtocolHandler('auth/gcalsync', async (params) => {
@@ -135,35 +137,40 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
             let isAuthenticated = this.authManager.isAuthenticated();
 
             // On mobile especially, we need to verify tokens are actually valid
+            // Defer this validation to after load completes to avoid blocking startup
             if (isAuthenticated && Platform.isMobile) {
-                console.log('Performing additional token validation on mobile');
-                try {
-                    // This will try to refresh if needed
-                    await this.authManager.getValidAccessToken();
-                    LogUtils.debug('Mobile token validation successful');
-                } catch (e) {
-                    console.error('Token validation failed on mobile, clearing auth state:', e);
+                setTimeout(async () => {
+                    console.log('Performing additional token validation on mobile');
+                    try {
+                        // This will try to refresh if needed
+                        await this.authManager?.getValidAccessToken();
+                        LogUtils.debug('Mobile token validation successful');
+                    } catch (e) {
+                        console.error('Token validation failed on mobile, clearing auth state:', e);
 
-                    // Provide more specific logging based on error type
-                    if (e instanceof Error) {
-                        if (e.message.includes('expired')) {
-                            LogUtils.error('Token expired and refresh failed');
-                        } else if (e.message.includes('network')) {
-                            LogUtils.error('Network error during token validation');
-                        } else {
-                            LogUtils.error(`Token validation error: ${e.message}`);
+                        // Provide more specific logging based on error type
+                        if (e instanceof Error) {
+                            if (e.message.includes('expired')) {
+                                LogUtils.error('Token expired and refresh failed');
+                            } else if (e.message.includes('network')) {
+                                LogUtils.error('Network error during token validation');
+                            } else {
+                                LogUtils.error(`Token validation error: ${e.message}`);
+                            }
                         }
-                    }
 
-                    isAuthenticated = false;
-                    if (this.settings.oauth2Tokens) {
-                        this.settings.oauth2Tokens = undefined;
-                        await this.saveSettings();
-                    }
+                        // Update authentication state
+                        useStore.getState().setAuthenticated(false);
+                        useStore.getState().setStatus('disconnected');
+                        if (this.settings.oauth2Tokens) {
+                            this.settings.oauth2Tokens = undefined;
+                            await this.saveSettings();
+                        }
 
-                    // Notify user about authentication issue
-                    new Notice('Authentication issue detected. Please reconnect to Google Calendar.', 8000);
-                }
+                        // Notify user about authentication issue
+                        new Notice('Authentication issue detected. Please reconnect to Google Calendar.', 8000);
+                    }
+                }, 100);
             }
 
             // Initialize metadata manager
@@ -199,15 +206,20 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
             // Initialize UI state
             this.updateRibbonStatus(useStore.getState().status);
 
-            // Subscribe to store changes
+            // Subscribe to store changes - wrapped in try-catch to prevent errors from causing issues
             this.unsubscribeStore = useStore.subscribe((state) => {
-                this.updateRibbonStatus(state.status);
-                this.updateStatusBar();
+                try {
+                    this.updateRibbonStatus(state.status);
+                    this.updateStatusBar();
+                } catch (error) {
+                    LogUtils.error('Error in store subscription:', error);
+                }
             });
 
             // Initialize calendar sync if authenticated
+            // Defer until after onload() completes to avoid blocking startup
             if (isAuthenticated) {
-                await this.initializeCalendarSync();
+                setTimeout(() => this.initializeCalendarSync(), 0);
             }
 
             // Register event handlers
@@ -216,89 +228,13 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
             // Start periodic cleanup
             this.startPeriodicCleanup();
 
-            // Register file change monitoring
-            this.registerEvent(
-                this.app.vault.on('modify', async (file: TAbstractFile) => {
-                    if (file instanceof TFile && this.isTaskFile(file)) {
-                        const state = useStore.getState();
-
-                        // First invalidate the cache
-                        state.invalidateFileCache(file.path);
-
-                        // Wait longer for the file system to settle (increased from 50ms to 150ms)
-                        await new Promise(resolve => setTimeout(resolve, 150));
-
-                        try {
-                            try {
-                                // Force a fresh read of the file content
-                                const content = await state.getFileContent(file.path);
-
-                                // Find all task lines in the file
-                                const lines = content.split('\n');
-                                const taskLines = lines.filter(line => this.taskParser.isTaskLine(line));
-
-                                if (taskLines.length === 0) return;
-
-                                // Parse tasks from task lines only
-                                const tasks = [];
-                                for (const line of taskLines) {
-                                    const task = await this.taskParser.parseTask(line, file.path);
-                                    if (task && task.id) {
-                                        tasks.push(task);
-                                    }
-                                }
-
-                                if (tasks.length > 0) {
-                                    // Filter out tasks that were just synced
-                                    const filteredTasks = tasks.filter(task => {
-                                        if (!task.id) return false;
-
-                                        // Skip recently synced tasks
-                                        const metadata = state.plugin.settings.taskMetadata?.[task.id];
-                                        if (metadata?.justSynced && metadata.syncTimestamp) {
-                                            const syncAge = Date.now() - metadata.syncTimestamp;
-                                            if (syncAge < 2000) { // 2 second window
-                                                LogUtils.debug(`Task ${task.id} was just synced ${syncAge}ms ago, skipping (primary handler)`);
-                                                return false;
-                                            }
-                                        }
-
-                                        // Skip locked tasks
-                                        if (state.isTaskLocked(task.id)) {
-                                            return false;
-                                        }
-
-                                        return true;
-                                    });
-
-                                    if (filteredTasks.length > 0) {
-                                        await state.enqueueTasks(filteredTasks);
-                                    }
-                                }
-                            } catch (fileError) {
-                                // Safely handle file reading errors
-                                LogUtils.error(`Failed to read file ${file.path}:`, fileError);
-                                new Notice(`Failed to read file: ${file.path}`);
-                            }
-                        } catch (error) {
-                            LogUtils.error(`Failed to process file changes for ${file.path}:`, error);
-                        }
-                    }
-                })
-            );
-
-            // Initialize store with plugin instance
-            initializeStore(this);
-
-            // Never show welcome modal on startup
-            // if (!this.settings.hasCompletedOnboarding) {
-            //     this.showWelcomeModal();
-            // }
+            // NOTE: File change monitoring is handled in registerEventHandlers()
+            // with proper debouncing to prevent double-syncing
 
             LogUtils.debug('Plugin loaded successfully');
         } catch (error) {
             LogUtils.error('Failed to load plugin:', error);
-            useStore.getState().setStatus('error', error as Error);
+            useStore.getState().setStatus('error', error instanceof Error ? error : new Error(String(error)));
         }
     }
 
@@ -347,7 +283,7 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
                             const metadata = state.plugin.settings.taskMetadata?.[task.id];
                             if (metadata?.justSynced && metadata.syncTimestamp) {
                                 const syncAge = Date.now() - metadata.syncTimestamp;
-                                if (syncAge < 2000) { // Use a longer window (2 seconds)
+                                if (syncAge < TIMING.JUST_SYNCED_WINDOW_MS) { // Use a longer window (2 seconds)
                                     LogUtils.debug(`Task ${task.id} was just synced ${syncAge}ms ago, skipping (file handler)`);
                                     continue;
                                 }
@@ -366,7 +302,7 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
                     } catch (error) {
                         LogUtils.error(`Failed to process file changes for ${file.path}:`, error);
                     }
-                }, 1000) // Reduced to 1 second for more responsive sync
+                }, TIMING.FILE_CHANGE_DEBOUNCE_MS) // Reduced to 1 second for more responsive sync
             )
         );
 
@@ -436,7 +372,7 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
                     if (view.file) {
                         await this.processEditorChanges(view.file);
                     }
-                }, 500) // Reduced to 500ms for more responsive sync
+                }, TIMING.EDITOR_CHANGE_DEBOUNCE_MS) // Reduced to 500ms for more responsive sync
             )
         );
     }
@@ -561,7 +497,7 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
             useStore.getState().setStatus('connected');
         } catch (error) {
             LogUtils.error('Failed to initialize calendar sync:', error);
-            useStore.getState().setStatus('error', error as Error);
+            useStore.getState().setStatus('error', error instanceof Error ? error : new Error(String(error)));
 
             // Check if this is an auth error and handle appropriately
             if (error instanceof Error &&
@@ -635,7 +571,7 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
             LogUtils.debug(`Metadata consistency check completed: removed ${orphanedMetadata.length} orphaned entries`);
         } catch (error) {
             LogUtils.error('Metadata consistency check failed:', error);
-            setStatus('error', error as Error);
+            setStatus('error', error instanceof Error ? error : new Error(String(error)));
             new Notice('Failed to verify task states');
         }
     }
@@ -644,7 +580,7 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
         // Run cleanup every 5 minutes
         this.cleanupInterval = window.setInterval(() => {
             useStore.getState().clearStaleProcessingTasks();
-        }, 5 * 60 * 1000);
+        }, TIMING.PERIODIC_CLEANUP_INTERVAL_MS);
     }
 
     private async cleanupOrphanedMetadata() {
@@ -704,6 +640,12 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
     async onunload() {
         try {
             console.log('🔄 Unloading Google Calendar Sync plugin...');
+
+            // Clear periodic cleanup interval to prevent memory leak
+            if (this.cleanupInterval) {
+                clearInterval(this.cleanupInterval);
+                this.cleanupInterval = null;
+            }
 
             // Clean up any pending sync operations
             useStore.getState().clearSyncQueue();
@@ -962,7 +904,7 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
         } catch (error) {
             console.error('❌ Sync failed:', error);
             state.endSync(false);
-            state.setStatus('error', error as Error);
+            state.setStatus('error', error instanceof Error ? error : new Error(String(error)));
             new Notice('Sync failed. Please try again.');
         } finally {
             state.disableTempSync();
@@ -994,7 +936,7 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
                 this.authManager.authorize();
             }
         } catch (error) {
-            useStore.getState().setStatus('error', error as Error);
+            useStore.getState().setStatus('error', error instanceof Error ? error : new Error(String(error)));
             new Notice('Failed to disconnect from Google Calendar');
         }
     }

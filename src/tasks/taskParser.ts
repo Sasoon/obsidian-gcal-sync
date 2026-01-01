@@ -1,6 +1,6 @@
-import { TFile, Editor, MarkdownPostProcessor, MarkdownPostProcessorContext, Notice, MarkdownView } from 'obsidian';
+import { TFile, Notice, MarkdownView } from 'obsidian';
 import { EditorView } from '@codemirror/view';
-import type { Task, TaskMetadata } from '../core/types';
+import type { Task, TaskMetadata, ParsedTaskData } from '../core/types';
 import type GoogleCalendarSyncPlugin from '../core/main';
 import { useStore } from '../core/store';
 import { LogUtils } from '../utils/logUtils';
@@ -386,7 +386,7 @@ export class TaskParser {
         return match ? match[1] : undefined;
     }
 
-    private isValidTaskData(taskData: any): boolean {
+    private isValidTaskData(taskData: ParsedTaskData): boolean {
         if (!taskData.date) return false;
 
         // Validate date format
@@ -476,15 +476,33 @@ export class TaskParser {
             }
 
             if (file instanceof TFile) {
-                const content = await this.plugin.app.vault.read(file);
-                await this.plugin.app.vault.modify(file, content + '\n' + formattedTaskLine);
+                const state = useStore.getState();
 
-                const view = this.getEditorView(file);
-                if (view) {
-                    const offset = content.length + formattedTaskLine.length + 1;
-                    this.plugin.tokenController.generateTaskId(view, offset);
+                // Acquire file lock
+                const lockKey = `file:${file.path}`;
+                if (state.isTaskLocked(lockKey)) {
+                    LogUtils.debug(`File ${file.path} is locked, waiting...`);
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                    // Retry once
+                    if (state.isTaskLocked(lockKey)) {
+                        throw new Error(`File ${file.path} is locked, cannot modify`);
+                    }
                 }
-                LogUtils.debug(`Created task: ${task.title}`);
+
+                state.addProcessingTask(lockKey);
+                try {
+                    const content = await this.plugin.app.vault.read(file);
+                    await this.plugin.app.vault.modify(file, content + '\n' + formattedTaskLine);
+
+                    const view = this.getEditorView(file);
+                    if (view) {
+                        const offset = content.length + formattedTaskLine.length + 1;
+                        this.plugin.tokenController.generateTaskId(view, offset);
+                    }
+                    LogUtils.debug(`Created task: ${task.title}`);
+                } finally {
+                    state.removeProcessingTask(lockKey);
+                }
             }
         } catch (error) {
             LogUtils.error(`Failed to create task: ${error}`);

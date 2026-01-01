@@ -76,7 +76,7 @@ export class RepairManager {
             try {
                 return await operation();
             } catch (error) {
-                lastError = error as Error;
+                lastError = error instanceof Error ? error : new Error(String(error));
                 if (attempt < maxRetries) {
                     await new Promise(resolve => setTimeout(resolve, this.RETRY_DELAY * attempt));
                     LogUtils.debug(`Retrying operation for task ${taskId}, attempt ${attempt + 1}/${maxRetries}`);
@@ -219,7 +219,7 @@ export class RepairManager {
                                 }
                             } catch (error) {
                                 LogUtils.error(`Failed to delete event for task ${task.id}:`, error);
-                                errors.set(task.id, error as Error);
+                                errors.set(task.id, error instanceof Error ? error : new Error(String(error)));
                             }
                         }
                         
@@ -250,7 +250,7 @@ export class RepairManager {
                                         return { taskId: task.id, eventId, success: true };
                                     }
                                 } catch (error) {
-                                    errors.set(task.id, error as Error);
+                                    errors.set(task.id, error instanceof Error ? error : new Error(String(error)));
                                     return { taskId: task.id, success: false, error };
                                 }
                             })

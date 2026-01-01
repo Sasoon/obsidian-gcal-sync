@@ -62,6 +62,8 @@ export interface GoogleCalendarSettings {
     clientId: string;
     clientSecret?: string;
     oauth2Tokens?: OAuth2Tokens;
+    encryptedOAuth2Tokens?: string; // Encrypted tokens (replaces oauth2Tokens when encrypted)
+    tokensEncrypted?: boolean; // Flag indicating tokens are stored encrypted
     syncEnabled: boolean;
     defaultReminder: number;
     includeFolders: string[];
@@ -155,4 +157,24 @@ export interface GoogleCalendarEvent {
 export interface TaskStore {
     lastSyncTime: number;
     lastSyncAttempt: number;
+}
+
+/**
+ * Interface for parsed task data before full validation
+ * Used in taskParser.ts for validating task data structure
+ */
+export interface ParsedTaskData {
+    date?: string;
+    time?: string;
+    endTime?: string;
+    reminder?: number;
+}
+
+/**
+ * Interface for API error responses with status information
+ * Used for proper error handling in calendarSync.ts
+ */
+export interface ApiError extends Error {
+    status?: number;
+    response?: string;
 }

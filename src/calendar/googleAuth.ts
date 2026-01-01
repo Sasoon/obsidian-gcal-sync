@@ -4,6 +4,7 @@ import type GoogleCalendarSyncPlugin from '../core/main';
 import type { OAuth2Tokens } from '../core/types';
 import { createHash } from 'crypto';
 import { LogUtils } from '../utils/logUtils';
+import { CryptoUtils } from '../utils/cryptoUtils';
 
 // Define constants for OAuth redirect URIs
 const DESKTOP_PORT = 8085;
@@ -23,6 +24,32 @@ export class GoogleAuthManager {
     private readonly plugin: GoogleCalendarSyncPlugin;
     private codeVerifier: string | null = null;
     private app: App;
+    private encryptionKey: CryptoKey | null = null;
+
+    /**
+     * Sanitize text for logging to prevent sensitive data leakage (tokens, secrets, etc.)
+     */
+    private sanitizeForLogging(text: string | undefined, maxLength = 100): string {
+        if (!text) return '[empty]';
+        if (text.length <= maxLength) return text;
+        return text.substring(0, maxLength) + '...(truncated)';
+    }
+
+    /**
+     * Sanitize a JSON response object for logging - removes sensitive fields
+     */
+    private sanitizeResponseForLogging(json: any): string {
+        if (!json) return '[empty]';
+        // Create a copy and remove sensitive fields
+        const sanitized = { ...json };
+        if (sanitized.access_token) sanitized.access_token = '[REDACTED]';
+        if (sanitized.refresh_token) sanitized.refresh_token = '[REDACTED]';
+        if (sanitized.id_token) sanitized.id_token = '[REDACTED]';
+        if (sanitized.error_description) {
+            sanitized.error_description = this.sanitizeForLogging(sanitized.error_description);
+        }
+        return JSON.stringify(sanitized);
+    }
 
     constructor(plugin: GoogleCalendarSyncPlugin) {
         this.plugin = plugin;
@@ -34,10 +61,25 @@ export class GoogleAuthManager {
 
         console.log(`🔐 Auth initialized - Using redirect URI: ${this.redirectUri}`);
 
-        // Load saved tokens immediately
-        this.loadSavedTokens().catch(error => {
-            console.error('Failed to load saved tokens:', error);
-        });
+        // Note: Token loading is handled explicitly in main.ts to avoid duplicate PBKDF2 calls
+    }
+
+    /**
+     * Gets or derives the encryption key for token storage
+     * Uses vault path as salt to tie tokens to this specific vault
+     */
+    private async getEncryptionKey(): Promise<CryptoKey> {
+        if (this.encryptionKey) {
+            return this.encryptionKey;
+        }
+
+        // Use vault path + plugin ID as salt for key derivation
+        // This ties the encrypted tokens to this specific vault installation
+        const vaultPath = (this.app.vault.adapter as any).basePath || 'obsidian-vault';
+        const salt = CryptoUtils.generateVaultSalt(vaultPath, 'obsidian-gcal-sync');
+
+        this.encryptionKey = await CryptoUtils.deriveKey(salt);
+        return this.encryptionKey;
     }
 
     async authorize(): Promise<void> {
@@ -56,13 +98,19 @@ export class GoogleAuthManager {
                 // Desktop flow - use local server
                 console.log('🔐 Desktop auth - Using redirect URI:', this.redirectUri);
 
+                // Generate state parameter for CSRF protection (matching mobile flow)
+                const state = this.generateRandomState();
+                this.plugin.settings.tempAuthState = state;
+                await this.plugin.saveSettings();
+
                 const params = new URLSearchParams({
                     client_id: this.clientId,
                     redirect_uri: this.redirectUri,
                     response_type: 'code',
                     scope: 'https://www.googleapis.com/auth/calendar.events',
                     access_type: 'offline',
-                    prompt: 'consent'
+                    prompt: 'consent',
+                    state: state // CSRF protection
                 });
 
                 const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
@@ -70,7 +118,18 @@ export class GoogleAuthManager {
 
                 try {
                     console.log('🔐 Waiting for auth code...');
-                    const code = await this.handleDesktopAuth(authUrl);
+                    const { code, returnedState } = await this.handleDesktopAuth(authUrl);
+
+                    // Validate state parameter
+                    const savedState = this.plugin.settings.tempAuthState;
+                    if (!savedState || savedState !== returnedState) {
+                        throw new Error('Invalid state parameter. Authentication failed (possible CSRF attack).');
+                    }
+
+                    // Clear state after validation
+                    this.plugin.settings.tempAuthState = undefined;
+                    await this.plugin.saveSettings();
+
                     console.log('🔐 Received auth code, exchanging for tokens...');
                     await this.handleAuthCode(code);
                     console.log('🔐 Token exchange completed successfully');
@@ -216,12 +275,12 @@ export class GoogleAuthManager {
             console.log('Token exchange response status:', response.status);
 
             if (response.status >= 400) {
-                console.error('❌ Error response from token exchange:', response.status, response.text);
-                throw new Error(`Token exchange failed with status ${response.status}: ${response.text}`);
+                console.error('❌ Error response from token exchange:', response.status, this.sanitizeForLogging(response.text));
+                throw new Error(`Token exchange failed with status ${response.status}`);
             }
 
             if (!response.json.access_token) {
-                console.error('❌ No access token in response:', response.json);
+                console.error('❌ No access token in response:', this.sanitizeResponseForLogging(response.json));
                 throw new Error('Failed to get access token');
             }
 
@@ -238,7 +297,7 @@ export class GoogleAuthManager {
             console.log('✅ Successfully exchanged code for tokens using PKCE flow');
 
         } catch (error) {
-            console.error('❌ PKCE token exchange failed:', error);
+            console.error('❌ PKCE token exchange failed:', error instanceof Error ? error.message : 'Unknown error');
             this.plugin.mobileAuthInitiated = false;
             throw error;
         }
@@ -265,7 +324,7 @@ export class GoogleAuthManager {
         return this.base64UrlEncode(new Uint8Array(digest));
     }
 
-    private async handleDesktopAuth(authUrl: string): Promise<string> {
+    private async handleDesktopAuth(authUrl: string): Promise<{ code: string; returnedState: string | null }> {
         return new Promise((resolve, reject) => {
             console.log('🔍 Starting local auth server setup on port', DESKTOP_PORT);
 
@@ -301,6 +360,7 @@ export class GoogleAuthManager {
                             const url = new URL(req.url, `http://localhost:${DESKTOP_PORT}`);
                             console.log('🔗 Parsed callback URL:', url.toString());
                             const code = url.searchParams.get('code');
+                            const returnedState = url.searchParams.get('state');
                             const error = url.searchParams.get('error');
 
                             if (error) {
@@ -314,12 +374,12 @@ export class GoogleAuthManager {
                             }
 
                             if (code) {
-                                console.log('✅ Received auth code');
+                                console.log('✅ Received auth code and state');
                                 res.writeHead(200, { 'Content-Type': 'text/html' });
                                 res.end(`<html><body><h1>Authentication successful!</h1><p>You can now close this window and return to Obsidian.</p></body></html>`);
                                 clearInterval(windowCheckInterval);
                                 server.close(() => console.log('🔒 Server closed successfully'));
-                                resolve(code);
+                                resolve({ code, returnedState });
                             }
                         } catch (error) {
                             console.error('Error handling auth callback:', error);
@@ -450,12 +510,12 @@ export class GoogleAuthManager {
             console.log('🔄 Netlify response status:', response.status);
 
             if (response.status >= 400) {
-                console.error('❌ Error response from Netlify:', response.status, response.text);
-                throw new Error(`Netlify function returned error ${response.status}: ${response.text}`);
+                console.error('❌ Error response from Netlify:', response.status, this.sanitizeForLogging(response.text));
+                throw new Error(`Netlify function returned error ${response.status}`);
             }
 
             if (!response.json.access_token) {
-                console.error('❌ No access token in response:', response.json);
+                console.error('❌ No access token in response:', this.sanitizeResponseForLogging(response.json));
                 throw new Error('Failed to get access token');
             }
 
@@ -493,12 +553,12 @@ export class GoogleAuthManager {
             });
 
             if (response.status >= 400) {
-                console.error('Token refresh failed with status', response.status, response.text);
-                throw new Error(`Token refresh failed with status ${response.status}: ${response.text}`);
+                console.error('Token refresh failed with status', response.status, this.sanitizeForLogging(response.text));
+                throw new Error(`Token refresh failed with status ${response.status}`);
             }
 
             if (!response.json || !response.json.access_token) {
-                console.error('Token refresh response missing access_token:', response.json);
+                console.error('Token refresh response missing access_token:', this.sanitizeResponseForLogging(response.json));
                 throw new Error('Failed to refresh access token');
             }
 
@@ -524,11 +584,11 @@ export class GoogleAuthManager {
         this.refreshToken = tokens.refresh_token || this.refreshToken;
         this.tokenExpiry = tokens.expiry_date;
 
-        // Save to plugin settings with additional security measures
+        // Save to plugin settings with encryption
         if (this.accessToken && this.refreshToken) {
             try {
                 // Add a timestamp for token age tracking
-                const securedTokens = {
+                const securedTokens: OAuth2Tokens = {
                     access_token: this.accessToken,
                     refresh_token: this.refreshToken,
                     expiry_date: this.tokenExpiry || 0,
@@ -537,13 +597,19 @@ export class GoogleAuthManager {
                     stored_at: Date.now(), // Track when the tokens were saved
                 };
 
-                // Store tokens in plugin settings
-                this.plugin.settings.oauth2Tokens = securedTokens as OAuth2Tokens;
+                // Encrypt tokens before storage
+                const encryptionKey = await this.getEncryptionKey();
+                const encryptedTokens = await CryptoUtils.encryptObject(securedTokens, encryptionKey);
+
+                // Store encrypted tokens and clear plain text tokens
+                this.plugin.settings.encryptedOAuth2Tokens = encryptedTokens;
+                this.plugin.settings.tokensEncrypted = true;
+                this.plugin.settings.oauth2Tokens = undefined; // Clear plain text tokens
                 await this.plugin.saveSettings();
 
                 // Log successful token storage without exposing token values
-                console.log(`Tokens saved successfully. Access token valid until: ${new Date(this.tokenExpiry || 0).toLocaleString()}`);
-                LogUtils.debug('Authentication tokens saved successfully');
+                console.log(`Tokens saved (encrypted). Access token valid until: ${new Date(this.tokenExpiry || 0).toLocaleString()}`);
+                LogUtils.debug('Authentication tokens saved with encryption');
             } catch (error) {
                 console.error('Error saving authentication tokens:', error);
                 LogUtils.error('Failed to save authentication tokens');
@@ -554,7 +620,42 @@ export class GoogleAuthManager {
 
     async loadSavedTokens(): Promise<boolean> {
         try {
-            const tokens = this.plugin.settings.oauth2Tokens;
+            let tokens: OAuth2Tokens | undefined;
+
+            // Check if we have encrypted tokens (new format)
+            if (this.plugin.settings.tokensEncrypted && this.plugin.settings.encryptedOAuth2Tokens) {
+                console.log('Loading encrypted tokens from settings');
+                try {
+                    const encryptionKey = await this.getEncryptionKey();
+                    tokens = await CryptoUtils.decryptObject<OAuth2Tokens>(
+                        this.plugin.settings.encryptedOAuth2Tokens,
+                        encryptionKey
+                    );
+                } catch (decryptError) {
+                    console.error('Failed to decrypt tokens:', decryptError);
+                    LogUtils.error('Token decryption failed. Please reconnect to Google Calendar.');
+                    // Clear corrupted encrypted tokens
+                    this.plugin.settings.encryptedOAuth2Tokens = undefined;
+                    this.plugin.settings.tokensEncrypted = false;
+                    await this.plugin.saveSettings();
+                    return false;
+                }
+            }
+            // Check for unencrypted tokens (legacy format) and migrate them
+            else if (this.plugin.settings.oauth2Tokens?.access_token) {
+                console.log('Found unencrypted tokens, migrating to encrypted storage');
+                tokens = this.plugin.settings.oauth2Tokens;
+
+                // Migrate to encrypted format
+                try {
+                    await this.saveTokens(tokens);
+                    console.log('Successfully migrated tokens to encrypted storage');
+                } catch (migrationError) {
+                    console.error('Failed to migrate tokens to encrypted storage:', migrationError);
+                    // Continue with unencrypted tokens for this session
+                }
+            }
+
             if (!tokens?.refresh_token || !tokens?.access_token) {
                 console.log('No saved tokens found');
                 return false;
@@ -592,6 +693,8 @@ export class GoogleAuthManager {
                     this.refreshToken = null;
                     this.tokenExpiry = null;
                     this.plugin.settings.oauth2Tokens = undefined;
+                    this.plugin.settings.encryptedOAuth2Tokens = undefined;
+                    this.plugin.settings.tokensEncrypted = false;
                     await this.plugin.saveSettings();
 
                     // Force re-authentication
@@ -646,9 +749,11 @@ export class GoogleAuthManager {
         this.refreshToken = null;
         this.tokenExpiry = null;
 
-        // Clear tokens from settings
-        if (this.plugin.settings.oauth2Tokens) {
+        // Clear tokens from settings (both encrypted and unencrypted)
+        if (this.plugin.settings.oauth2Tokens || this.plugin.settings.encryptedOAuth2Tokens) {
             this.plugin.settings.oauth2Tokens = undefined;
+            this.plugin.settings.encryptedOAuth2Tokens = undefined;
+            this.plugin.settings.tokensEncrypted = false;
             await this.plugin.saveSettings();
             console.log('Cleared tokens from settings');
         }

@@ -1,5 +1,5 @@
 import { requestUrl, Notice } from 'obsidian';
-import type { Task, TaskMetadata } from '../core/types';
+import type { Task, TaskMetadata, ApiError } from '../core/types';
 import type GoogleCalendarSyncPlugin from '../core/main';
 import type { GoogleCalendarEvent } from '../repair/types';
 import { LogUtils } from '../utils/logUtils';
@@ -8,6 +8,7 @@ import { TimeUtils } from '../utils/timeUtils';
 import { retryWithBackoff } from '../utils/retryUtils';
 import { hasTaskChanged } from '../utils/taskUtils';
 import { useStore } from '../core/store';
+import { TIMING } from '../config/constants';
 import { RepairManager } from '../repair/repairManager';
 import { Platform } from 'obsidian';
 
@@ -97,37 +98,37 @@ export class CalendarSync {
         }
     }
 
-    private async withLock<T>(lockKey: string, operation: () => Promise<T>, maxWaitTime: number = 30000): Promise<T> {
+    private async withLock<T>(lockKey: string, operation: () => Promise<T>, maxWaitTime: number = TIMING.LOCK_TIMEOUT_MS): Promise<T> {
         const state = useStore.getState();
         const startTime = Date.now();
 
-        // Remove any 'task:' prefix if it exists
-        const normalizedKey = lockKey.replace(/^task:/, '');
+        // Normalize lock key: lowercase, trim whitespace, consistent colon separator
+        const normalizedKey = lockKey.toLowerCase().trim().replace(/\s+/g, '');
 
         // Generate a unique operation ID for this specific lock attempt
-        const operationId = `${normalizedKey}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-        LogUtils.debug(`Lock operation started: ${operationId} for ${normalizedKey}`);
+        const operationId = `${normalizedKey.substring(0, 20)}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+        LogUtils.debug(`Lock operation started: ${operationId} for key "${normalizedKey}"`);
 
         // If we already have the lock (i.e. we're the processing task), proceed
         if (state.processingTasks.has(normalizedKey)) {
-            LogUtils.debug(`Already have lock for ${normalizedKey}, proceeding with operation ${operationId}`);
+            LogUtils.debug(`Already have lock for "${normalizedKey}", proceeding with operation ${operationId}`);
             return operation();
         }
 
         // Try to acquire lock with exponential backoff
         while (state.isTaskLocked(normalizedKey)) {
             if (Date.now() - startTime > maxWaitTime) {
-                LogUtils.warn(`Lock acquisition timeout for ${normalizedKey} (${operationId}) after ${maxWaitTime}ms`);
+                LogUtils.warn(`Lock acquisition timeout for key "${normalizedKey}" (operation: ${operationId}) after ${maxWaitTime}ms`);
 
                 // Instead of throwing, force-release the lock if it appears to be stale
                 const lockTime = state.getLockTimestamp(normalizedKey);
-                if (lockTime && Date.now() - lockTime > 30000) { // 30 second max lock time (reduced from 1 minute)
-                    LogUtils.warn(`Force-releasing potentially stale lock for ${normalizedKey} (locked for ${Date.now() - lockTime}ms)`);
+                if (lockTime && Date.now() - lockTime > TIMING.LOCK_TIMEOUT_MS) {
+                    LogUtils.warn(`Force-releasing potentially stale lock for key "${normalizedKey}" (locked for ${Date.now() - lockTime}ms)`);
                     state.removeProcessingTask(normalizedKey);
                     break;
                 }
 
-                throw new Error(`Failed to acquire lock for ${normalizedKey} after ${maxWaitTime}ms`);
+                throw new Error(`Lock timeout: Failed to acquire lock for key "${normalizedKey}" after ${maxWaitTime}ms (operation: ${operationId})`);
             }
 
             // Exponential backoff with jitter to prevent thundering herd
@@ -136,32 +137,48 @@ export class CalendarSync {
             const jitter = Math.floor(Math.random() * 100); // Add random jitter
             const waitTime = baseWait + jitter;
 
-            LogUtils.debug(`Waiting ${waitTime}ms for lock on ${normalizedKey} (attempt ${attempts + 1})`);
+            LogUtils.debug(`Waiting ${waitTime}ms for lock on "${normalizedKey}" (attempt ${attempts + 1})`);
             await new Promise(resolve => setTimeout(resolve, waitTime));
             state.incrementLockAttempts(normalizedKey);
         }
 
+        // Track timeout handle for cleanup
+        let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+
         try {
-            LogUtils.debug(`Acquired lock for ${normalizedKey} (${operationId})`);
+            LogUtils.debug(`Acquired lock for "${normalizedKey}" (${operationId})`);
             state.addProcessingTask(normalizedKey);
 
             // Add operation timeout as an additional safety measure
             const timeoutPromise = new Promise<never>((_, reject) => {
-                setTimeout(() => {
-                    reject(new Error(`Operation timeout for ${normalizedKey} (${operationId})`));
+                timeoutHandle = setTimeout(() => {
+                    reject(new Error(`Operation timeout: Lock "${normalizedKey}" held too long (operation: ${operationId}, max: ${maxWaitTime}ms)`));
                 }, maxWaitTime);
             });
 
             // Race between operation and timeout
-            return await Promise.race([
+            const result = await Promise.race([
                 operation(),
                 timeoutPromise
             ]);
+
+            // Clear the timeout on successful completion to prevent memory leaks
+            if (timeoutHandle) {
+                clearTimeout(timeoutHandle);
+                timeoutHandle = null;
+            }
+
+            return result;
         } catch (error) {
-            LogUtils.error(`Error during locked operation ${operationId} for ${normalizedKey}:`, error);
+            // Clear the timeout on error to prevent memory leaks
+            if (timeoutHandle) {
+                clearTimeout(timeoutHandle);
+                timeoutHandle = null;
+            }
+            LogUtils.error(`Error during locked operation ${operationId} for key "${normalizedKey}":`, error);
             throw error;
         } finally {
-            LogUtils.debug(`Releasing lock for ${normalizedKey} (${operationId})`);
+            LogUtils.debug(`Releasing lock for "${normalizedKey}" (${operationId})`);
             state.removeProcessingTask(normalizedKey);
             state.resetLockAttempts(normalizedKey);
         }
@@ -176,7 +193,9 @@ export class CalendarSync {
             } catch (error) {
                 // If the event is already gone (410) or not found (404), consider it a success
                 if (error instanceof Error &&
-                    (error.message.includes('status 410') || error.message.includes('status 404'))) {
+                    (error.message.includes('status 410') ||
+                     error.message.includes('status 404') ||
+                     error.message.includes('Event already deleted'))) {
                     LogUtils.debug(`Event ${eventId} already deleted or not found`);
                     return;
                 }
@@ -185,29 +204,15 @@ export class CalendarSync {
                     LogUtils.debug(`Successfully deleted event (empty response): ${eventId}`);
                     return;
                 }
-                // Only log as error if it's not one of the expected cases
-                if (!(error instanceof Error &&
-                    (error.message.includes('status 410') ||
-                        error.message.includes('status 404') ||
-                        (error instanceof SyntaxError && error.message.includes('Unexpected end of JSON input'))))) {
-                    LogUtils.error(`Failed to delete calendar event ${eventId}:`, error);
-                }
-                // Don't throw error for already deleted events
-                if (error instanceof Error &&
-                    (error.message.includes('status 410') ||
-                        error.message.includes('status 404') ||
-                        error.message.includes('Event already deleted'))) {
-                    return;
-                }
+                // Log and rethrow unexpected errors
+                LogUtils.error(`Failed to delete calendar event ${eventId}:`, error);
                 throw ErrorUtils.handleCommonErrors(error);
             }
         };
 
         if (taskId) {
-            // If we have a taskId, lock both task and event
-            return this.withLock(`task:${taskId}`, () =>
-                this.withLock(`event:${eventId}`, operation)
-            );
+            // Use a single composite lock key instead of nested locks to prevent deadlocks
+            return this.withLock(`task:${taskId}:event:${eventId}`, operation);
         } else {
             // If no taskId, just lock the event
             return this.withLock(`event:${eventId}`, operation);
@@ -215,44 +220,43 @@ export class CalendarSync {
     }
 
     public async updateEvent(task: Task, eventId: string): Promise<void> {
-        return this.withLock(`task:${task.id}`, async () => {
-            return this.withLock(`event:${eventId}`, async () => {
-                try {
-                    if (!task.id) {
-                        throw new Error('Cannot update event for task without ID');
-                    }
-
-                    // Check if the event still exists and is valid
-                    const metadata = this.plugin.settings.taskMetadata[task.id];
-                    if (!metadata || metadata.eventId !== eventId) {
-                        LogUtils.debug(`Event ${eventId} no longer associated with task ${task.id}, skipping update`);
-                        return;
-                    }
-
-                    const event = this.createEventFromTask(task);
-                    await this.makeRequest(`/calendars/primary/events/${eventId}`, 'PUT', event);
-                    LogUtils.debug(`Updated event ${eventId} for task ${task.id}`);
-
-                    const updatedMetadata = {
-                        ...metadata,
-                        eventId,
-                        title: task.title,
-                        date: task.date,
-                        time: task.time,
-                        endTime: task.endTime,
-                        reminder: task.reminder,
-                        completed: task.completed,
-                        lastModified: Date.now(),
-                        lastSynced: Date.now()
-                    };
-
-                    this.plugin.settings.taskMetadata[task.id] = updatedMetadata;
-                    await this.plugin.saveSettings();
-                } catch (error) {
-                    LogUtils.error(`Failed to update event ${eventId} for task ${task.id}: ${error}`);
-                    throw ErrorUtils.handleCommonErrors(error);
+        // Use a single composite lock key instead of nested locks to prevent deadlocks
+        return this.withLock(`task:${task.id}:event:${eventId}`, async () => {
+            try {
+                if (!task.id) {
+                    throw new Error('Cannot update event for task without ID');
                 }
-            });
+
+                // Check if the event still exists and is valid
+                const metadata = this.plugin.settings.taskMetadata[task.id];
+                if (!metadata || metadata.eventId !== eventId) {
+                    LogUtils.debug(`Event ${eventId} no longer associated with task ${task.id}, skipping update`);
+                    return;
+                }
+
+                const event = this.createEventFromTask(task);
+                await this.makeRequest(`/calendars/primary/events/${eventId}`, 'PUT', event);
+                LogUtils.debug(`Updated event ${eventId} for task ${task.id}`);
+
+                const updatedMetadata = {
+                    ...metadata,
+                    eventId,
+                    title: task.title,
+                    date: task.date,
+                    time: task.time,
+                    endTime: task.endTime,
+                    reminder: task.reminder,
+                    completed: task.completed,
+                    lastModified: Date.now(),
+                    lastSynced: Date.now()
+                };
+
+                this.plugin.settings.taskMetadata[task.id] = updatedMetadata;
+                await this.plugin.saveSettings();
+            } catch (error) {
+                LogUtils.error(`Failed to update event ${eventId} for task ${task.id}: ${error}`);
+                throw ErrorUtils.handleCommonErrors(error);
+            }
         });
     }
 
@@ -392,12 +396,15 @@ export class CalendarSync {
 
                         // Check for any failures
                         const failures = deleteResults.filter(result => result.status === 'rejected');
+
                         if (failures.length > 0) {
-                            LogUtils.error(`Failed to delete some events for completed task ${task.id}:`, failures);
+                            // Log which events failed but DON'T delete metadata yet
+                            LogUtils.error(`Failed to delete ${failures.length}/${taskEvents.length} events for completed task ${task.id}`);
+                            // Keep metadata for retry on next sync
                             throw new Error(`Failed to delete ${failures.length} events for completed task`);
                         }
 
-                        // Only remove metadata after successful event deletion
+                        // ALL events deleted successfully, NOW safe to delete metadata
                         if (metadata) {
                             delete this.plugin.settings.taskMetadata[task.id];
                             await this.saveSettings();
@@ -507,7 +514,7 @@ export class CalendarSync {
                 this.plugin.settings.taskMetadata[task.id] = currentMetadata;
                 this.plugin.saveSettings();
             }
-        }, 3500);  // 3.5 second cooldown - longer to ensure it covers all event handlers
+        }, TIMING.JUST_SYNCED_FLAG_CLEAR_MS);  // 3.5 second cooldown - longer to ensure it covers all event handlers
 
         // Clear the events cache to ensure fresh data for the next request
         // This is important after modifying an event
@@ -583,8 +590,35 @@ export class CalendarSync {
         state.incrementRateLimit();
     }
 
+    /**
+     * Sanitize text for logging to prevent sensitive data leakage
+     */
+    private sanitizeForLogging(text: string | undefined, maxLength = 100): string {
+        if (!text) return '[empty]';
+        if (text.length <= maxLength) return text;
+        return text.substring(0, maxLength) + '...(truncated)';
+    }
+
+    /**
+     * Execute a request with timeout using Promise.race
+     */
+    private async requestWithTimeout(options: Parameters<typeof requestUrl>[0]): Promise<any> {
+        const timeoutMs = TIMING.REQUEST_TIMEOUT_MS;
+
+        const timeoutPromise = new Promise<never>((_, reject) => {
+            setTimeout(() => {
+                reject(new Error(`Request timeout after ${timeoutMs}ms`));
+            }, timeoutMs);
+        });
+
+        return Promise.race([
+            requestUrl(options),
+            timeoutPromise
+        ]);
+    }
+
     private async makeRequest(endpoint: string, method: string, params?: any): Promise<any> {
-        try {
+        return retryWithBackoff(async () => {
             // Check rate limit before making the request
             await this.checkRateLimit();
 
@@ -601,137 +635,83 @@ export class CalendarSync {
 
             LogUtils.debug(`Making API request: ${method} ${endpoint}`);
             if (this.plugin.settings.verboseLogging) {
-                LogUtils.debug(`Request details: 
-                    URL: ${requestUrlString}
-                    Method: ${method}
-                    Params: ${params ? JSON.stringify(params) : 'none'}`
-                );
+                LogUtils.debug(`Request details: URL: ${requestUrlString}, Method: ${method}, Params: ${params ? JSON.stringify(params) : 'none'}`);
             }
 
-            const response = await requestUrl({
-                url: requestUrlString,
-                method,
-                headers: {
-                    'Authorization': `Bearer ${accessToken}`,
-                    'Content-Type': 'application/json',
-                },
-                body: method !== 'GET' && params ? JSON.stringify(params) : undefined
-            });
+            try {
+                const response = await this.requestWithTimeout({
+                    url: requestUrlString,
+                    method,
+                    headers: {
+                        'Authorization': `Bearer ${accessToken}`,
+                        'Content-Type': 'application/json',
+                    },
+                    body: method !== 'GET' && params ? JSON.stringify(params) : undefined
+                });
 
-            // Special handling for 410 Gone on DELETE requests
-            if (response.status === 410 && method === 'DELETE') {
-                LogUtils.debug('Resource already deleted');
-                return null;
-            }
-
-            if (response.status >= 400) {
-                // Log full error details
-                LogUtils.error(`API request failed (${method} ${endpoint}): 
-                    Status: ${response.status}
-                    Response: ${response.text}`
-                );
-
-                const error = new Error(`Request failed, status ${response.status}: ${response.text}`);
-                (error as any).status = response.status;
-                (error as any).response = response.text;
-                throw error;
-            }
-
-            // For DELETE requests or empty responses, return null
-            if (method === 'DELETE' || !response.text) {
-                return null;
-            }
-
-            LogUtils.debug(`API request successful: ${method} ${endpoint}`);
-            return response.json;
-        } catch (error) {
-            return retryWithBackoff(async () => {
-                try {
-                    if (!this.plugin.authManager) {
-                        throw new Error('Auth manager not initialized');
-                    }
-
-                    const accessToken = await this.plugin.authManager.getValidAccessToken();
-                    const url = `${this.BASE_URL}${endpoint}`;
-
-                    const requestUrlString = method === 'GET' && params ?
-                        `${url}?${new URLSearchParams(params)}` :
-                        url;
-
-                    LogUtils.debug(`Making API request: ${method} ${endpoint}`);
-                    if (this.plugin.settings.verboseLogging) {
-                        LogUtils.debug(`Request details: 
-                        URL: ${requestUrlString}
-                        Method: ${method}
-                        Params: ${params ? JSON.stringify(params) : 'none'}`
-                        );
-                    }
-
-                    const response = await requestUrl({
-                        url: requestUrlString,
-                        method,
-                        headers: {
-                            'Authorization': `Bearer ${accessToken}`,
-                            'Content-Type': 'application/json',
-                        },
-                        body: method !== 'GET' && params ? JSON.stringify(params) : undefined
-                    });
-
-                    // Special handling for 410 Gone on DELETE requests
-                    if (response.status === 410 && method === 'DELETE') {
-                        LogUtils.debug('Resource already deleted');
-                        return null;
-                    }
-
-                    if (response.status >= 400) {
-                        // Log full error details
-                        LogUtils.error(`API request failed (${method} ${endpoint}): 
-                        Status: ${response.status}
-                        Response: ${response.text}`
-                        );
-
-                        const error = new Error(`Request failed, status ${response.status}: ${response.text}`);
-                        (error as any).status = response.status;
-                        (error as any).response = response.text;
-                        throw error;
-                    }
-
-                    // For DELETE requests or empty responses, return null
-                    if (method === 'DELETE' || !response.text) {
-                        return null;
-                    }
-
-                    LogUtils.debug(`API request successful: ${method} ${endpoint}`);
-                    return response.json;
-                } catch (error) {
-                    // Don't log 410 errors for DELETE requests as they're expected
-                    if (!(error instanceof Error && error.message.includes('status 410') && method === 'DELETE')) {
-                        LogUtils.error(`API request failed (${method} ${endpoint}): ${error}`);
-
-                        // Add better error information for debugging
-                        if (this.plugin.settings.verboseLogging) {
-                            LogUtils.error(`Request details: 
-                            Endpoint: ${endpoint}
-                            Method: ${method}
-                            Params: ${params ? JSON.stringify(params) : 'none'}
-                            Error: ${(error as Error).message}
-                            Stack: ${(error as Error).stack}`
-                            );
-                        }
-
-                        // Show a notice for specific errors
-                        if ((error as any).status === 400) {
-                            new Notice(`Calendar API error (400): Check your authenticated account has calendar access`);
-                        } else if ((error as any).status === 401) {
-                            new Notice(`Authentication error (401): Your session has expired. Please reconnect to Google Calendar.`);
-                        } else if ((error as any).status === 403) {
-                            new Notice(`Permission error (403): You don't have permission to access this calendar.`);
-                        }
-                    }
-                    throw ErrorUtils.handleCommonErrors(error);
+                // Special handling for 410 Gone on DELETE requests
+                if (response.status === 410 && method === 'DELETE') {
+                    LogUtils.debug('Resource already deleted');
+                    return null;
                 }
-            });
-        }
+
+                if (response.status >= 400) {
+                    // Log error details with sanitized response
+                    LogUtils.error(`API request failed (${method} ${endpoint}): Status: ${response.status}, Response: ${this.sanitizeForLogging(response.text)}`);
+
+                    const apiError: ApiError = new Error(`Request failed, status ${response.status}`);
+                    apiError.status = response.status;
+                    apiError.response = response.text;
+                    throw apiError;
+                }
+
+                // For DELETE requests or empty responses, return null
+                if (method === 'DELETE' || !response.text) {
+                    return null;
+                }
+
+                LogUtils.debug(`API request successful: ${method} ${endpoint}`);
+                return response.json;
+            } catch (error) {
+                // Don't log 410 errors for DELETE requests as they're expected
+                if (!(error instanceof Error && error.message.includes('status 410') && method === 'DELETE')) {
+                    const safeError = error instanceof Error ? error : new Error(String(error));
+                    LogUtils.error(`API request failed (${method} ${endpoint}): ${safeError.message}`);
+
+                    // Add better error information for debugging (without sensitive response data)
+                    if (this.plugin.settings.verboseLogging) {
+                        LogUtils.error(`Request details: Endpoint: ${endpoint}, Method: ${method}, Error: ${safeError.message}`);
+                    }
+
+                    // Show a notice for specific errors - check if it's an ApiError
+                    const apiError = error as ApiError;
+                    if (apiError.status === 400) {
+                        new Notice(`Calendar API error (400): Check your authenticated account has calendar access`);
+                    } else if (apiError.status === 401) {
+                        new Notice(`Authentication error (401): Your session has expired. Please reconnect to Google Calendar.`);
+                    } else if (apiError.status === 403) {
+                        new Notice(`Permission error (403): You don't have permission to access this calendar.`);
+                    }
+                }
+                throw ErrorUtils.handleCommonErrors(error);
+            }
+        }, {
+            maxAttempts: 3,
+            initialDelay: 1000,
+            shouldRetry: (error) => {
+                // Retry on network errors, timeouts, and 5xx/429 responses
+                if (error instanceof Error) {
+                    // Always retry on timeout
+                    if (error.message.includes('timeout')) {
+                        return true;
+                    }
+                    const status = (error as any).status;
+                    // Retry on server errors and rate limiting, but not client errors
+                    return !status || status >= 500 || status === 429;
+                }
+                return true;
+            }
+        });
     }
 
     public getTimezoneOffset(): string {
