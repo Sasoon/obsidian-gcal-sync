@@ -12,9 +12,7 @@ const DESKTOP_HOST = '127.0.0.1';
 const DESKTOP_PATH = '/callback';
 const REDIRECT_URL = `http://${DESKTOP_HOST}:${DESKTOP_PORT}${DESKTOP_PATH}`;
 
-//const REDIRECT_URL_MOBILE = 'https://obsidian-gcal-sync-netlify-oauth.netlify.app/redirect.html';
-// killswitch
-const REDIRECT_URL_MOBILE = REDIRECT_URL;
+const REDIRECT_URL_MOBILE = 'https://obsidian-gcal-sync-netlify-oauth.netlify.app/redirect.html';
 
 const GOOGLE_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
 
