@@ -120,12 +120,15 @@ export class CalendarSync {
             if (Date.now() - startTime > maxWaitTime) {
                 LogUtils.warn(`Lock acquisition timeout for key "${normalizedKey}" (operation: ${operationId}) after ${maxWaitTime}ms`);
 
-                // Instead of throwing, force-release the lock if it appears to be stale
+                // Check if the lock appears to be stale
                 const lockTime = state.getLockTimestamp(normalizedKey);
                 if (lockTime && Date.now() - lockTime > TIMING.LOCK_TIMEOUT_MS) {
-                    LogUtils.warn(`Force-releasing potentially stale lock for key "${normalizedKey}" (locked for ${Date.now() - lockTime}ms)`);
+                    // Force-release the stale lock, but DON'T proceed with this operation
+                    // The original operation might still be running (just slow/stuck)
+                    LogUtils.warn(`Force-releasing stale lock for key "${normalizedKey}" (locked for ${Date.now() - lockTime}ms)`);
                     state.removeProcessingTask(normalizedKey);
-                    break;
+                    // Abort this operation to prevent duplicate execution
+                    throw new Error(`Stale lock released for "${normalizedKey}". Operation ${operationId} aborted - retry will be scheduled.`);
                 }
 
                 throw new Error(`Lock timeout: Failed to acquire lock for key "${normalizedKey}" after ${maxWaitTime}ms (operation: ${operationId})`);
@@ -266,19 +269,26 @@ export class CalendarSync {
         if (metadata?.justSynced && metadata.syncTimestamp) {
             const syncAge = Date.now() - metadata.syncTimestamp;
             if (syncAge < 1500) {
-                LogUtils.debug(`⚡ Task ${taskId} was just synced ${syncAge}ms ago, skipping withQueuedProcessing entirely`);
+                LogUtils.debug(`Task ${taskId} was just synced ${syncAge}ms ago, skipping`);
                 return undefined;
             }
         }
 
-        // If task is being processed, check if it's just a reminder change
-        if (this.processingQueue.has(taskId)) {
+        // ATOMIC CHECK-AND-ADD: Do this synchronously (no await) to prevent race conditions
+        // JavaScript is single-threaded for synchronous operations
+        const alreadyProcessing = this.processingQueue.has(taskId);
+        if (!alreadyProcessing) {
+            // Claim the slot BEFORE any await to prevent races
+            this.processingQueue.add(taskId);
+        }
+
+        // Handle the "already processing" case (now safe to do async operations)
+        if (alreadyProcessing) {
             try {
-                const state = useStore.getState();
                 const freshTask = await this.getTaskData(taskId);
 
                 if (freshTask && metadata) {
-                    LogUtils.debug(`Task ${taskId} has new changes while being processed, waiting for current operation to finish`);
+                    LogUtils.debug(`Task ${taskId} has changes while being processed, waiting for current operation`);
                     const currentPromise = this.processingPromises.get(taskId);
                     if (currentPromise) {
                         await currentPromise;
@@ -289,10 +299,10 @@ export class CalendarSync {
                 LogUtils.error(`Error checking task state for ${taskId}:`, error);
                 return undefined;
             }
+            return undefined;
         }
 
-        // Add to processing queue and track with promise
-        this.processingQueue.add(taskId);
+        // We own the slot in processingQueue (added synchronously above)
         const promise = (async () => {
             try {
                 return await operation();

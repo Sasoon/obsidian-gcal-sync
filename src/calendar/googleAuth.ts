@@ -357,11 +357,19 @@ export class GoogleAuthManager {
                 let server: any;
                 let authCancelled = false;
                 let authWindow: Window | null = null;
+                let authTimeoutId: ReturnType<typeof setTimeout> | null = null;
+
+                // Helper to clean up all timers and resources
+                const cleanup = (interval: ReturnType<typeof setInterval>) => {
+                    clearInterval(interval);
+                    if (authTimeoutId) clearTimeout(authTimeoutId);
+                };
+
                 const windowCheckInterval = setInterval(() => {
                     // Check if auth window was closed prematurely by user
                     if (authWindow && authWindow.closed && !authCancelled) {
                         authCancelled = true;
-                        clearInterval(windowCheckInterval);
+                        cleanup(windowCheckInterval);
                         console.log('Auth window was closed prematurely by user');
                         try {
                             if (server) {
@@ -392,7 +400,7 @@ export class GoogleAuthManager {
                                 console.error('❌ Auth error received:', error);
                                 res.writeHead(400, { 'Content-Type': 'text/html' });
                                 res.end(`<html><body><h1>Authentication failed</h1><p>Error: ${error}</p></body></html>`);
-                                clearInterval(windowCheckInterval);
+                                cleanup(windowCheckInterval);
                                 server.close(() => console.log('🔒 Server closed after error'));
                                 reject(new Error(`Authentication error: ${error}`));
                                 return;
@@ -402,13 +410,13 @@ export class GoogleAuthManager {
                                 console.log('✅ Received auth code and state');
                                 res.writeHead(200, { 'Content-Type': 'text/html' });
                                 res.end(`<html><body><h1>Authentication successful!</h1><p>You can now close this window and return to Obsidian.</p></body></html>`);
-                                clearInterval(windowCheckInterval);
+                                cleanup(windowCheckInterval);
                                 server.close(() => console.log('🔒 Server closed successfully'));
                                 resolve({ code, returnedState });
                             }
                         } catch (error) {
                             console.error('Error handling auth callback:', error);
-                            clearInterval(windowCheckInterval);
+                            cleanup(windowCheckInterval);
                             res.writeHead(500, { 'Content-Type': 'text/plain' });
                             res.end('Internal server error');
                             reject(error);
@@ -447,7 +455,7 @@ export class GoogleAuthManager {
                                 } catch (e2) {
                                     console.error('❌ Failed to open auth window:', e2);
                                     new Notice('Failed to open authentication window. Please check popup blockers.');
-                                    clearInterval(windowCheckInterval);
+                                    cleanup(windowCheckInterval);
                                     server.close();
                                     reject(new Error('Failed to open authentication window'));
                                 }
@@ -464,10 +472,10 @@ export class GoogleAuthManager {
                 }
 
                 // Set a timeout for the entire auth process
-                const authTimeoutId = setTimeout(() => {
+                authTimeoutId = setTimeout(() => {
                     if (!authCancelled) {
                         authCancelled = true;
-                        clearInterval(windowCheckInterval);
+                        cleanup(windowCheckInterval);
                         try {
                             if (server) {
                                 server.close(() => console.log('🔒 Server closed after timeout'));
@@ -485,8 +493,7 @@ export class GoogleAuthManager {
                 window.addEventListener('beforeunload', () => {
                     if (!authCancelled) {
                         authCancelled = true;
-                        clearTimeout(authTimeoutId);
-                        clearInterval(windowCheckInterval);
+                        cleanup(windowCheckInterval);
                         try {
                             if (server) {
                                 server.close();

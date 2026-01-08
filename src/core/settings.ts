@@ -9,7 +9,7 @@ export const DEFAULT_SETTINGS: GoogleCalendarSettings = {
     oauth2Tokens: undefined,
     syncEnabled: true,
     defaultReminder: 30,
-    includeFolders: ['calendar/daily/2025-02-27'],  // Empty by default to scan all folders
+    includeFolders: [],  // Empty by default to scan all folders
     taskMetadata: {},
     taskIds: {},
     verboseLogging: true,  // Default to false for new users

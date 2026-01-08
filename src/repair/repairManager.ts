@@ -381,19 +381,24 @@ export class RepairManager {
                     // If task ID doesn't exist in Obsidian, delete all its events
                     if (!activeTaskIds.has(taskId)) {
                         LogUtils.debug(`Task ${taskId} not found in Obsidian, deleting ${events.length} events`);
+                        let allDeletesSucceeded = true;
                         for (const event of events) {
                             try {
                                 await this.plugin.calendarSync?.deleteEvent(event.id, taskId);
                                 LogUtils.debug(`Deleted orphaned event ${event.id} for task ${taskId}`);
                             } catch (error) {
                                 LogUtils.error(`Failed to delete orphaned event ${event.id}:`, error);
+                                allDeletesSucceeded = false;
                             }
                         }
 
-                        // Clean up metadata for non-existent task
-                        if (this.plugin.settings.taskMetadata[taskId]) {
+                        // Only clean up metadata if ALL event deletions succeeded
+                        if (allDeletesSucceeded && this.plugin.settings.taskMetadata[taskId]) {
                             delete this.plugin.settings.taskMetadata[taskId];
                             await this.plugin.saveSettings();
+                            LogUtils.debug(`Deleted metadata for orphaned task ${taskId}`);
+                        } else if (!allDeletesSucceeded) {
+                            LogUtils.warn(`Keeping metadata for task ${taskId} - some event deletions failed`);
                         }
                     } else if (events.length > 1) {
                         // If multiple events exist for same task, keep only the most recent
@@ -465,14 +470,18 @@ export class RepairManager {
                             try {
                                 await this.plugin.calendarSync?.deleteEvent(taskMetadata.eventId, taskId);
                                 LogUtils.debug(`Deleted orphaned event ${taskMetadata.eventId} for task ${taskId}`);
+                                // Only delete metadata after successful event deletion
+                                delete metadata[taskId];
+                                LogUtils.debug(`Deleted orphaned metadata for task ${taskId}`);
                             } catch (error) {
                                 LogUtils.error(`Failed to delete orphaned event ${taskMetadata.eventId}:`, error);
+                                // Keep metadata for retry - don't delete it
                             }
+                        } else {
+                            // No event to delete, safe to remove metadata
+                            delete metadata[taskId];
+                            LogUtils.debug(`Deleted orphaned metadata for task ${taskId} (no event)`);
                         }
-
-                        // Delete metadata
-                        delete metadata[taskId];
-                        LogUtils.debug(`Deleted orphaned metadata for task ${taskId}`);
                     }
 
                     processedItems++;

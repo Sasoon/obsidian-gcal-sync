@@ -18,14 +18,21 @@ export class TimeUtils {
     }
 
     /**
-     * Checks if a date is valid
+     * Checks if a date is valid (rejects invalid dates like 2025-13-45 or Feb 30)
      */
     static isValidDate(date: string): boolean {
         const regex = /^\d{4}-\d{2}-\d{2}$/;
         if (!regex.test(date)) return false;
 
-        const d = new Date(date);
-        return d instanceof Date && !isNaN(d.getTime());
+        const [year, month, day] = date.split('-').map(Number);
+        if (month < 1 || month > 12) return false;
+        if (day < 1 || day > 31) return false;
+
+        // Create date and verify it didn't wrap (catches Feb 30, Apr 31, etc)
+        const d = new Date(year, month - 1, day);
+        return d.getFullYear() === year &&
+               d.getMonth() === month - 1 &&
+               d.getDate() === day;
     }
 
     /**
