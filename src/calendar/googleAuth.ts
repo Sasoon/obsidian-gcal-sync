@@ -14,6 +14,8 @@ const REDIRECT_URL = `http://${DESKTOP_HOST}:${DESKTOP_PORT}${DESKTOP_PATH}`;
 
 const REDIRECT_URL_MOBILE = 'https://obsidian-gcal-sync-netlify-oauth.netlify.app/redirect.html';
 
+const GOOGLE_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
+
 export class GoogleAuthManager {
     private clientId: string;
     private clientSecret: string | null;
@@ -247,30 +249,53 @@ export class GoogleAuthManager {
             console.log('🔄 Exchanging auth code for tokens using PKCE flow');
             console.log('Code verifier length:', this.codeVerifier.length);
             console.log('Redirect URI:', this.redirectUri);
-            console.log('IMPORTANT - For mobile auth, make sure this redirect URI exactly matches what is registered in Google Cloud Console');
 
-            const requestBody = {
-                operation: 'exchange_code_pkce',
-                code: code,
-                code_verifier: this.codeVerifier,
-                redirect_uri: this.redirectUri,
-                client_id: this.clientId
-            };
+            let response: any;
 
-            console.log('Token exchange request:', JSON.stringify({
-                ...requestBody,
-                code: code.substring(0, 5) + '...',  // Only log part of the code for security
-                code_verifier: this.codeVerifier.substring(0, 5) + '...'  // Only log part of the verifier for security
-            }, null, 2));
+            if (this.clientSecret) {
+                console.log('🔄 Exchanging with PKCE locally (custom client)');
+                response = await requestUrl({
+                    url: GOOGLE_TOKEN_ENDPOINT,
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                    },
+                    body: new URLSearchParams({
+                        code: code,
+                        client_id: this.clientId,
+                        client_secret: this.clientSecret,
+                        redirect_uri: this.redirectUri,
+                        grant_type: 'authorization_code',
+                        code_verifier: this.codeVerifier,
+                    }).toString()
+                });
 
-            const response = await requestUrl({
-                url: 'https://obsidian-gcal-sync-netlify-oauth.netlify.app/.netlify/functions/token-exchange',
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify(requestBody)
-            });
+            } else {
+                console.log('IMPORTANT - For mobile auth, make sure this redirect URI exactly matches what is registered in Google Cloud Console');
+
+                const requestBody = {
+                    operation: 'exchange_code_pkce',
+                    code: code,
+                    code_verifier: this.codeVerifier,
+                    redirect_uri: this.redirectUri,
+                    client_id: this.clientId
+                };
+
+                console.log('Token exchange request:', JSON.stringify({
+                    ...requestBody,
+                    code: code.substring(0, 5) + '...',  // Only log part of the code for security
+                    code_verifier: this.codeVerifier.substring(0, 5) + '...'  // Only log part of the verifier for security
+                }, null, 2));
+
+                response = await requestUrl({
+                    url: 'https://obsidian-gcal-sync-netlify-oauth.netlify.app/.netlify/functions/token-exchange',
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(requestBody)
+                });
+            }
 
             console.log('Token exchange response status:', response.status);
 
@@ -492,26 +517,45 @@ export class GoogleAuthManager {
     }
 
     private async exchangeCodeForTokens(code: string): Promise<OAuth2Tokens> {
-        console.log('🔄 Calling Netlify function for token exchange');
         try {
-            const response = await requestUrl({
-                url: 'https://obsidian-gcal-sync-netlify-oauth.netlify.app/.netlify/functions/token-exchange',
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    operation: 'exchange_code',
-                    code: code,
-                    platform: 'desktop'
-                })
-            });
-
-            console.log('🔄 Netlify response status:', response.status);
+            var response;
+            if (this.clientSecret) {
+                console.log('🔄 Exchanging auth code for tokens locally');
+                response = await requestUrl({
+                    url: GOOGLE_TOKEN_ENDPOINT,
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                    },
+                    body: new URLSearchParams({
+                        code: code,
+                        client_id: this.clientId,
+                        client_secret: this.clientSecret,
+                        redirect_uri: this.redirectUri,
+                        grant_type: 'authorization_code',
+                    }).toString()
+                });
+                console.log('🔄 Google Oauth response status:', response.status);
+            } else {
+                console.log('🔄 Calling Netlify function for token exchange');
+                response = await requestUrl({
+                    url: 'https://obsidian-gcal-sync-netlify-oauth.netlify.app/.netlify/functions/token-exchange',
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        operation: 'exchange_code',
+                        code: code,
+                        platform: 'desktop'
+                    })
+                });
+                console.log('🔄 Netlify response status:', response.status);
+            }
 
             if (response.status >= 400) {
-                console.error('❌ Error response from Netlify:', response.status, this.sanitizeForLogging(response.text));
-                throw new Error(`Netlify function returned error ${response.status}`);
+                console.error('❌ Error response from token exchange:', response.status, this.sanitizeForLogging(response.text));
+                throw new Error(`Oauth server returned error ${response.status}`);
             }
 
             if (!response.json.access_token) {
@@ -538,20 +582,38 @@ export class GoogleAuthManager {
         }
 
         try {
-            console.log('Refreshing access token...');
-
-            const response = await requestUrl({
-                url: 'https://obsidian-gcal-sync-netlify-oauth.netlify.app/.netlify/functions/token-exchange',
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    operation: 'refresh_token',
-                    refresh_token: this.refreshToken
-                })
-            });
-
+            var response
+            if (this.clientSecret) {
+                console.log('🔄 Refreshing access token locally...');
+                response = await requestUrl({
+                    url: GOOGLE_TOKEN_ENDPOINT,
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                    },
+                    body: new URLSearchParams({
+                        refresh_token: this.refreshToken,
+                        client_id: this.clientId,
+                        client_secret: this.clientSecret,
+                        grant_type: 'refresh_token',
+                    }).toString()
+                });
+                console.log('🔄 Google Oauth response status:', response.status);
+            } else {
+                console.log('🔄 Refreshing access token via Netlify function...');
+                response = await requestUrl({
+                    url: 'https://obsidian-gcal-sync-netlify-oauth.netlify.app/.netlify/functions/token-exchange',
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        operation: 'refresh_token',
+                        refresh_token: this.refreshToken
+                    })
+                });
+                console.log('🔄 Netlify response status:', response.status);
+            }
             if (response.status >= 400) {
                 console.error('Token refresh failed with status', response.status, this.sanitizeForLogging(response.text));
                 throw new Error(`Token refresh failed with status ${response.status}`);
