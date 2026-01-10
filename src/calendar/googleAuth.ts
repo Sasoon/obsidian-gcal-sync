@@ -56,9 +56,23 @@ export class GoogleAuthManager {
     constructor(plugin: GoogleCalendarSyncPlugin) {
         this.plugin = plugin;
         this.app = plugin.app;
-        const credentials = loadGoogleCredentials();
-        this.clientId = credentials.clientId;
-        this.clientSecret = credentials.clientSecret || null;
+
+        // Prefer user-provided credentials from settings, fall back to defaults
+        const settings = plugin.settings;
+        const defaultCredentials = loadGoogleCredentials();
+
+        // Use custom credentials if both clientId and clientSecret are provided
+        if (settings.clientId && settings.clientSecret) {
+            this.clientId = settings.clientId;
+            this.clientSecret = settings.clientSecret;
+            console.log('🔐 Using custom OAuth credentials from settings');
+        } else {
+            // Fall back to default credentials
+            this.clientId = defaultCredentials.clientId;
+            this.clientSecret = defaultCredentials.clientSecret || null;
+            console.log('🔐 Using default OAuth credentials');
+        }
+
         this.redirectUri = Platform.isMobile ? REDIRECT_URL_MOBILE : REDIRECT_URL;
 
         console.log(`🔐 Auth initialized - Using redirect URI: ${this.redirectUri}`);
