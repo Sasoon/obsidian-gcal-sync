@@ -72,7 +72,7 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
             this.registerObsidianProtocolHandler('auth/gcalsync', async (params) => {
                 if (this.authManager) {
                     try {
-                        console.log('Received protocol callback with parameters:', params);
+                        console.log('Received protocol callback (parameters redacted for security)');
 
                         if (!params.code) {
                             throw new Error('Missing authorization code in callback parameters');
@@ -115,9 +115,7 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
                         new Notice(errorMessage, 10000); // Show for 10 seconds for better visibility
 
                         // Update UI state
-                        useStore.getState().setStatus('disconnected');
                         useStore.getState().setAuthenticated(false);
-                        // Store error in status
                         useStore.getState().setStatus('error', error instanceof Error ? error : new Error(String(error)));
                     }
                 }
@@ -257,10 +255,6 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
                         // Get the file content
                         const state = useStore.getState();
                         state.invalidateFileCache(file.path);
-
-                        // Add a small delay to ensure filesystem has the latest content
-                        await new Promise(resolve => setTimeout(resolve, 100));
-
                         const content = await state.getFileContent(file.path);
 
                         // Find all task lines in the file
@@ -389,12 +383,8 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
         try {
             // First check if we can read the file
             try {
-                // Force fresh content read with better timing
+                // Force fresh content read
                 await state.invalidateFileCache(file.path);
-
-                // Add a small delay to ensure filesystem has the latest content
-                await new Promise(resolve => setTimeout(resolve, 100));
-
                 await state.getFileContent(file.path);
             } catch (fileError) {
                 LogUtils.error(`Failed to read file ${file.path} during editor changes:`, fileError);
@@ -468,12 +458,18 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
         try {
             addProcessingTask(taskId);
             if (eventId) {
-                console.log('Deleting calendar event:', eventId);
-                await this.calendarSync?.deleteEvent(eventId);
-                console.log('Successfully deleted event:', eventId);
+                LogUtils.debug(`Deleting calendar event: ${eventId}`);
+                try {
+                    await this.calendarSync?.deleteEvent(eventId);
+                    LogUtils.debug(`Successfully deleted event: ${eventId}`);
+                } catch (deleteError) {
+                    // Log but continue — still clean up metadata even if calendar deletion fails
+                    // (event may already be deleted, or API may be temporarily unavailable)
+                    LogUtils.error(`Failed to delete calendar event ${eventId}:`, deleteError);
+                }
             }
             await this.metadataManager?.removeTaskMetadata(taskId);
-            console.log('Cleaned up task metadata');
+            LogUtils.debug('Cleaned up task metadata');
         } finally {
             removeProcessingTask(taskId);
         }
@@ -524,105 +520,11 @@ export default class GoogleCalendarSyncPlugin extends Plugin {
         }
     }
 
-    private async ensureMetadataConsistency() {
-        const { setStatus } = useStore.getState();
-
-        try {
-            // Get all tasks
-            const tasks = await this.getAllTasks();
-            const taskIdMap = new Map(tasks.map(t => [t.id, t]));
-
-            // Get all metadata entries
-            const metadataEntries = Object.entries(this.settings.taskMetadata);
-
-            // Identify orphaned metadata (no matching task)
-            const orphanedMetadata = metadataEntries.filter(([id]) => !taskIdMap.has(id));
-
-            // Remove orphaned metadata
-            for (const [id] of orphanedMetadata) {
-                const metadata = this.settings.taskMetadata[id];
-
-                // Delete associated calendar event if it exists
-                if (metadata?.eventId && this.calendarSync) {
-                    try {
-                        await this.calendarSync.deleteEvent(metadata.eventId);
-                    } catch (e) {
-                        LogUtils.error(`Failed to delete event for orphaned metadata ${id}:`, e);
-                    }
-                }
-
-                delete this.settings.taskMetadata[id];
-                delete this.settings.taskIds[id];
-            }
-
-            // Verify remaining tasks have valid metadata
-            for (const task of tasks) {
-                if (!task.id) continue;
-
-                const metadata = this.settings.taskMetadata[task.id];
-                if (!metadata) continue;
-
-                // Check basic consistency
-                if (metadata.title !== task.title ||
-                    metadata.date !== task.date ||
-                    metadata.time !== task.time ||
-                    metadata.completed !== task.completed) {
-
-                    // Requeue task for sync to correct inconsistency
-                    useStore.getState().addToSyncQueue(task.id);
-                }
-            }
-
-            await this.saveSettings();
-            setStatus('connected');
-            LogUtils.debug(`Metadata consistency check completed: removed ${orphanedMetadata.length} orphaned entries`);
-        } catch (error) {
-            LogUtils.error('Metadata consistency check failed:', error);
-            setStatus('error', error instanceof Error ? error : new Error(String(error)));
-            new Notice('Failed to verify task states');
-        }
-    }
-
     private startPeriodicCleanup() {
         // Run cleanup every 5 minutes
         this.cleanupInterval = window.setInterval(() => {
             useStore.getState().clearStaleProcessingTasks();
         }, TIMING.PERIODIC_CLEANUP_INTERVAL_MS);
-    }
-
-    private async cleanupOrphanedMetadata() {
-        const state = useStore.getState();
-        if (!state.isSyncEnabled()) return;
-
-        try {
-            const tasks = await this.getAllTasks();
-            const allTaskIds = new Set(tasks.map(t => t.id));
-            const orphanedIds = Object.keys(this.settings.taskMetadata)
-                .filter(id => !allTaskIds.has(id));
-
-            for (const id of orphanedIds) {
-                if (state.isTaskLocked(id)) {
-                    LogUtils.debug('Orphaned task is locked, skipping cleanup:', id);
-                    continue;
-                }
-
-                try {
-                    state.addProcessingTask(id);
-                    const metadata = this.settings.taskMetadata[id];
-                    if (metadata?.eventId) {
-                        await this.calendarSync?.deleteEvent(metadata.eventId);
-                    }
-                    delete this.settings.taskMetadata[id];
-                    delete this.settings.taskIds[id];
-                } finally {
-                    state.removeProcessingTask(id);
-                }
-            }
-
-            await this.saveSettings();
-        } catch (error) {
-            LogUtils.error('Failed to cleanup orphaned metadata:', error);
-        }
     }
 
     private async getAllTasks(): Promise<Task[]> {
