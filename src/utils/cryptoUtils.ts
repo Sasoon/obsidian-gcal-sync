@@ -26,8 +26,8 @@ export class CryptoUtils {
         return crypto.subtle.deriveKey(
             {
                 name: 'PBKDF2',
-                salt: encoder.encode(PLUGIN_SALT),
-                iterations: 10000,
+                salt: encoder.encode(salt + PLUGIN_SALT),
+                iterations: 310000,
                 hash: 'SHA-256'
             },
             keyMaterial,
