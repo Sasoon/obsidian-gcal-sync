@@ -99,7 +99,6 @@ export class CalendarSync {
     }
 
     private async withLock<T>(lockKey: string, operation: () => Promise<T>, maxWaitTime: number = TIMING.LOCK_TIMEOUT_MS): Promise<T> {
-        const state = useStore.getState();
         const startTime = Date.now();
 
         // Normalize lock key: lowercase, trim whitespace, consistent colon separator
@@ -110,23 +109,24 @@ export class CalendarSync {
         LogUtils.debug(`Lock operation started: ${operationId} for key "${normalizedKey}"`);
 
         // If we already have the lock (i.e. we're the processing task), proceed
-        if (state.processingTasks.has(normalizedKey)) {
+        if (useStore.getState().processingTasks.has(normalizedKey)) {
             LogUtils.debug(`Already have lock for "${normalizedKey}", proceeding with operation ${operationId}`);
             return operation();
         }
 
         // Try to acquire lock with exponential backoff
-        while (state.isTaskLocked(normalizedKey)) {
+        // Re-read state on each iteration to see lock releases by other code paths
+        while (useStore.getState().isTaskLocked(normalizedKey)) {
             if (Date.now() - startTime > maxWaitTime) {
                 LogUtils.warn(`Lock acquisition timeout for key "${normalizedKey}" (operation: ${operationId}) after ${maxWaitTime}ms`);
 
                 // Check if the lock appears to be stale
-                const lockTime = state.getLockTimestamp(normalizedKey);
+                const lockTime = useStore.getState().getLockTimestamp(normalizedKey);
                 if (lockTime && Date.now() - lockTime > TIMING.LOCK_TIMEOUT_MS) {
                     // Force-release the stale lock, but DON'T proceed with this operation
                     // The original operation might still be running (just slow/stuck)
                     LogUtils.warn(`Force-releasing stale lock for key "${normalizedKey}" (locked for ${Date.now() - lockTime}ms)`);
-                    state.removeProcessingTask(normalizedKey);
+                    useStore.getState().removeProcessingTask(normalizedKey);
                     // Abort this operation to prevent duplicate execution
                     throw new Error(`Stale lock released for "${normalizedKey}". Operation ${operationId} aborted - retry will be scheduled.`);
                 }
@@ -135,14 +135,14 @@ export class CalendarSync {
             }
 
             // Exponential backoff with jitter to prevent thundering herd
-            const attempts = state.getLockAttempts(normalizedKey);
+            const attempts = useStore.getState().getLockAttempts(normalizedKey);
             const baseWait = Math.min(Math.pow(2, attempts) * 100, 1000);
             const jitter = Math.floor(Math.random() * 100); // Add random jitter
             const waitTime = baseWait + jitter;
 
             LogUtils.debug(`Waiting ${waitTime}ms for lock on "${normalizedKey}" (attempt ${attempts + 1})`);
             await new Promise(resolve => setTimeout(resolve, waitTime));
-            state.incrementLockAttempts(normalizedKey);
+            useStore.getState().incrementLockAttempts(normalizedKey);
         }
 
         // Track timeout handle for cleanup
@@ -150,7 +150,7 @@ export class CalendarSync {
 
         try {
             LogUtils.debug(`Acquired lock for "${normalizedKey}" (${operationId})`);
-            state.addProcessingTask(normalizedKey);
+            useStore.getState().addProcessingTask(normalizedKey);
 
             // Add operation timeout as an additional safety measure
             const timeoutPromise = new Promise<never>((_, reject) => {
@@ -182,8 +182,8 @@ export class CalendarSync {
             throw error;
         } finally {
             LogUtils.debug(`Releasing lock for "${normalizedKey}" (${operationId})`);
-            state.removeProcessingTask(normalizedKey);
-            state.resetLockAttempts(normalizedKey);
+            useStore.getState().removeProcessingTask(normalizedKey);
+            useStore.getState().resetLockAttempts(normalizedKey);
         }
     }
 
@@ -195,10 +195,7 @@ export class CalendarSync {
                 LogUtils.debug(`Successfully deleted event: ${eventId}`);
             } catch (error) {
                 // If the event is already gone (410) or not found (404), consider it a success
-                if (error instanceof Error &&
-                    (error.message.includes('status 410') ||
-                     error.message.includes('status 404') ||
-                     error.message.includes('Event already deleted'))) {
+                if (ErrorUtils.isEventGoneError(error)) {
                     LogUtils.debug(`Event ${eventId} already deleted or not found`);
                     return;
                 }
@@ -371,34 +368,55 @@ export class CalendarSync {
 
         return this.withQueuedProcessing(task.id, async () => {
             try {
-                // Always get fresh task data to ensure we have the latest state
-                const freshTask = await this.getTaskData(task.id);
-                if (!freshTask) {
-                    LogUtils.warn(`Task ${task.id} not found, skipping sync`);
-                    return;
-                }
+                // Trust the task data from the caller — it was already freshly parsed
+                // by processSyncQueue or the editor change handler. Re-fetching here
+                // added ~100ms latency per task with no benefit.
 
                 // Get metadata and check for existing events
                 const metadata = this.plugin.settings.taskMetadata[task.id];
 
-                // Use the cached events instead of making a new request each time
-                const events = await this.findAllObsidianEvents();
+                // Only log task data once per sync operation
+                LogUtils.debug(`Processing task ${task.id}: ${JSON.stringify({
+                    title: task.title,
+                    date: task.date,
+                    time: task.time,
+                    reminder: task.reminder,
+                    completed: task.completed,
+                    filePath: task.filePath
+                })}`);
+
+                // ── FAST PATH: use metadata eventId as source of truth ──
+                // The events cache can be stale (up to 10s), which causes duplicates
+                // when multiple syncs fire in quick succession. The metadata is always
+                // up-to-date because we write it synchronously after each API call.
+                if (metadata?.eventId && !task.completed) {
+                    try {
+                        const event = this.createEventFromTask(task);
+                        await this.makeRequest(`/calendars/primary/events/${metadata.eventId}`, 'PUT', event);
+                        this.updateTaskMetadata(task, metadata.eventId, metadata);
+                        await this.saveSettings();
+                        LogUtils.debug(`Updated existing event ${metadata.eventId} for task ${task.id} (via metadata fast path)`);
+                        return;
+                    } catch (error) {
+                        // If the event was deleted externally (404/410), fall through to create path
+                        if (ErrorUtils.isEventGoneError(error)) {
+                            LogUtils.debug(`Event ${metadata.eventId} no longer exists, will create new one`);
+                        } else {
+                            throw error;
+                        }
+                    }
+                }
+
+                // ── SLOW PATH: query calendar API for task events ──
+                // Only used for: completed tasks, new tasks (no metadata), or when the
+                // metadata eventId was stale (event deleted externally)
+                const events = await this.findAllObsidianEvents({ forceFresh: true });
                 const taskEvents = events.filter(event =>
                     event.extendedProperties?.private?.obsidianTaskId === task.id
                 );
 
-                // Only log task data once per sync operation
-                LogUtils.debug(`Processing task ${task.id}: ${JSON.stringify({
-                    title: freshTask.title,
-                    date: freshTask.date,
-                    time: freshTask.time,
-                    reminder: freshTask.reminder,
-                    completed: freshTask.completed,
-                    filePath: freshTask.filePath
-                })}`);
-
                 // Force sync for completed tasks regardless of change detection
-                if (freshTask.completed) {
+                if (task.completed) {
                     LogUtils.debug(`Task ${task.id} is marked as completed, forcing sync to delete events`);
                     try {
                         // Delete all events first
@@ -408,9 +426,7 @@ export class CalendarSync {
                         const failures = deleteResults.filter(result => result.status === 'rejected');
 
                         if (failures.length > 0) {
-                            // Log which events failed but DON'T delete metadata yet
                             LogUtils.error(`Failed to delete ${failures.length}/${taskEvents.length} events for completed task ${task.id}`);
-                            // Keep metadata for retry on next sync
                             throw new Error(`Failed to delete ${failures.length} events for completed task`);
                         }
 
@@ -419,6 +435,7 @@ export class CalendarSync {
                             delete this.plugin.settings.taskMetadata[task.id];
                             await this.saveSettings();
                         }
+                        this.clearEventsCache(); // Invalidate cache after deletions
                         LogUtils.debug(`Task ${task.id} completed, successfully deleted ${taskEvents.length} associated events`);
                         return;
                     } catch (error) {
@@ -427,7 +444,7 @@ export class CalendarSync {
                     }
                 }
 
-                // Handle existing events
+                // Handle existing events found via API
                 if (taskEvents.length > 0) {
                     // Keep the most recently created event
                     const [keepEvent, ...duplicates] = taskEvents.sort((a, b) =>
@@ -438,22 +455,24 @@ export class CalendarSync {
                     if (duplicates.length > 0) {
                         LogUtils.debug(`Cleaning up ${duplicates.length} duplicate events for task ${task.id}`);
                         await Promise.all(duplicates.map(event => this.deleteEvent(event.id)));
+                        this.clearEventsCache(); // Invalidate after cleanup
                     }
 
                     // Update the kept event
-                    const event = this.createEventFromTask(freshTask);
+                    const event = this.createEventFromTask(task);
                     await this.makeRequest(`/calendars/primary/events/${keepEvent.id}`, 'PUT', event);
-                    this.updateTaskMetadata(freshTask, keepEvent.id, metadata);
+                    this.updateTaskMetadata(task, keepEvent.id, metadata);
                     await this.saveSettings();
                     LogUtils.debug(`Updated existing event ${keepEvent.id} for task ${task.id}`);
                     return;
                 }
 
                 // Create new event only if we don't have any existing ones
-                const newEventId = await this.createEvent(freshTask);
+                const newEventId = await this.createEvent(task);
                 if (newEventId) {
-                    this.updateTaskMetadata(freshTask, newEventId, metadata);
+                    this.updateTaskMetadata(task, newEventId, metadata);
                     await this.saveSettings();
+                    this.clearEventsCache(); // Invalidate after creation so next sync sees it
                     LogUtils.debug(`Created new event ${newEventId} for task ${task.id}`);
                 }
             } catch (error) {
@@ -516,19 +535,19 @@ export class CalendarSync {
 
         // Set a timeout to clear the "justSynced" flag after a cooldown period
         // This prevents immediate resyncs but allows future edits to be synced
+        // Note: only clear in memory — no saveSettings() call needed here since
+        // justSynced is an ephemeral runtime flag, not important to persist to disk
         setTimeout(() => {
             const currentMetadata = this.plugin.settings.taskMetadata[task.id];
             if (currentMetadata && currentMetadata.syncOperationId === opId) {
                 LogUtils.debug(`Clearing "justSynced" flag for task ${task.id} (op:${opId})`);
                 currentMetadata.justSynced = false;
-                this.plugin.settings.taskMetadata[task.id] = currentMetadata;
-                this.plugin.saveSettings();
             }
         }, TIMING.JUST_SYNCED_FLAG_CLEAR_MS);  // 3.5 second cooldown - longer to ensure it covers all event handlers
 
-        // Clear the events cache to ensure fresh data for the next request
-        // This is important after modifying an event
-        this.clearEventsCache();
+        // NOTE: Do NOT clear events cache here. Clearing per-task forces a fresh API call
+        // for every subsequent task in the batch. The cache is cleared at sync cycle boundaries
+        // (start/end of processSyncQueue) instead, reducing API calls from O(n) to O(1).
 
         // On mobile, ensure the timestamp is synchronized with additional logging
         if (Platform.isMobile) {
@@ -570,44 +589,19 @@ export class CalendarSync {
             const waitTime = state.rateLimit.resetTime - now;
             LogUtils.warn(`Rate limit reached (${state.rateLimit.requestCount}/${effectiveLimit}), waiting ${Math.round(waitTime / 1000)}s with backoff multiplier ${backoffMultiplier.toFixed(2)}`);
 
-            // Create a cancellable wait promise with timeout reporting
-            let waitComplete = false;
-            const waitPromise = new Promise<void>(resolve => {
-                const interval = window.setInterval(() => {
-                    const remaining = Math.max(0, state.rateLimit.resetTime - Date.now());
-                    if (remaining % 5000 === 0 && remaining > 0) { // Log every 5 seconds
-                        LogUtils.debug(`Still waiting for rate limit: ${Math.round(remaining / 1000)}s remaining`);
-                    }
-                    if (remaining <= 0 || waitComplete) {
-                        clearInterval(interval);
-                        resolve();
-                    }
-                }, 1000);
-
-                // Also resolve after the wait time
+            // Wait for the rate limit window to reset
+            await new Promise<void>(resolve => {
                 window.setTimeout(() => {
-                    waitComplete = true;
-                    clearInterval(interval);
                     resolve();
                 }, waitTime);
             });
-
-            await waitPromise;
-            state.resetRateLimit();
+            useStore.getState().resetRateLimit();
         }
 
         // Track this request
         state.incrementRateLimit();
     }
 
-    /**
-     * Sanitize text for logging to prevent sensitive data leakage
-     */
-    private sanitizeForLogging(text: string | undefined, maxLength = 100): string {
-        if (!text) return '[empty]';
-        if (text.length <= maxLength) return text;
-        return text.substring(0, maxLength) + '...(truncated)';
-    }
 
     /**
      * Execute a request with timeout using Promise.race
@@ -667,7 +661,7 @@ export class CalendarSync {
 
                 if (response.status >= 400) {
                     // Log error details with sanitized response
-                    LogUtils.error(`API request failed (${method} ${endpoint}): Status: ${response.status}, Response: ${this.sanitizeForLogging(response.text)}`);
+                    LogUtils.error(`API request failed (${method} ${endpoint}): Status: ${response.status}, Response: ${LogUtils.sanitize(response.text)}`);
 
                     const apiError: ApiError = new Error(`Request failed, status ${response.status}`);
                     apiError.status = response.status;
@@ -762,7 +756,8 @@ export class CalendarSync {
      * @param forceFresh Force a fresh fetch from API instead of using cache
      * @returns Array of calendar events
      */
-    public async findAllObsidianEvents(timeMin?: string, timeMax?: string, forceFresh: boolean = false): Promise<GoogleCalendarEvent[]> {
+    public async findAllObsidianEvents(options?: { timeMin?: string; timeMax?: string; forceFresh?: boolean }): Promise<GoogleCalendarEvent[]> {
+        const { timeMin, timeMax, forceFresh = false } = options ?? {};
         try {
             // Generate a cache key based on the time parameters
             const cacheKey = `events-${timeMin || 'none'}-${timeMax || 'none'}`;
@@ -953,9 +948,6 @@ export class CalendarSync {
                 // Force file cache invalidation
                 const state = useStore.getState();
                 state.invalidateFileCache(metadata.filePath);
-
-                // Add a small delay to ensure filesystem has the latest content
-                await new Promise(resolve => setTimeout(resolve, 100));
             }
 
             // Now get the task with fresh data
