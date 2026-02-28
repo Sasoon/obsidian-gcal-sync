@@ -33,11 +33,10 @@ export class LogUtils {
     }
 
     /**
-     * Error level logging
+     * Error level logging (console only - use notify() for user-visible errors)
      */
     static error(message: string, error?: any) {
         console.error(`${LOG_LEVELS.ERROR} ${message}`, error);
-        new Notice(`Error: ${message}`);
     }
 
     /**
@@ -53,6 +52,15 @@ export class LogUtils {
     static notify(message: string, isError = false) {
         const icon = isError ? LOG_LEVELS.ERROR : LOG_LEVELS.SUCCESS;
         new Notice(`${icon} ${message}`);
+    }
+
+    /**
+     * Sanitize text for logging to prevent sensitive data leakage (tokens, secrets, etc.)
+     */
+    static sanitize(text: string | undefined, maxLength = 100): string {
+        if (!text) return '[empty]';
+        if (text.length <= maxLength) return text;
+        return text.substring(0, maxLength) + '...(truncated)';
     }
 
     /**
