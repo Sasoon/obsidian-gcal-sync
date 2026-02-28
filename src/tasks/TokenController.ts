@@ -82,9 +82,13 @@ export class TokenController {
 
                     let changed = false
                     // Only remove IDs that no longer exist in the file
-                    for (const id of Object.keys(this.plugin.settings.taskMetadata)) {
+                    // IMPORTANT: Only check tasks whose filePath matches this file
+                    // to avoid deleting tasks that belong to other files
+                    for (const [id, metadata] of Object.entries(this.plugin.settings.taskMetadata)) {
+                        if (metadata?.filePath && metadata.filePath !== file.path) {
+                            continue; // Skip tasks belonging to other files
+                        }
                         if (!currentIds.has(id)) {
-                            const metadata = this.plugin.settings.taskMetadata[id];
                             const eventId = metadata?.eventId;
                             await this.plugin.handleTaskDeletion(id, eventId);
                             changed = true;
