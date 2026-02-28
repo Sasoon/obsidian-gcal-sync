@@ -103,17 +103,15 @@ export class TaskParser {
         }
 
         try {
-            // Force cache invalidation before reading
             const state = useStore.getState();
 
-            // More aggressive cache invalidation on mobile
+            // Invalidate cache before reading to ensure fresh content
+            state.invalidateFileCache(file.path);
+
+            // Small delay on mobile to ensure file system has latest content
             if (Platform.isMobile) {
-                state.invalidateFileCache(file.path);
-                // Small delay to ensure file system has latest content
                 await new Promise(resolve => setTimeout(resolve, 50));
             }
-
-            state.invalidateFileCache(file.path);
 
             // Get fresh content
             const content = await state.getFileContent(file.path);
@@ -256,109 +254,9 @@ export class TaskParser {
                 completedDate: this.getCompletionDate(line)
             };
 
-            // Use atomic state access
-            const state = useStore.getState();
-            if (state.isSyncAllowed() && id && metadata?.eventId) {
-                const result = hasTaskChanged(task, metadata, task.id);
-                const hasChanged = result.changed;
-                if (hasChanged) {
-                    LogUtils.debug(`Task has changed: ${id}`, task);
-
-                    // Simple lock check with timeout to prevent permanent locks
-                    // If the task has been in the processing state for more than 30 seconds,
-                    // assume the lock is stale and proceed anyway
-                    const isLocked = state.isTaskLocked(id);
-                    const lockTimeout = 30000; // 30 seconds
-
-                    // Use a fallback mechanism to detect stale locks
-                    let shouldProcess = !isLocked;
-
-                    // Check if this is a potentially stale lock
-                    if (isLocked) {
-                        // We don't have a direct way to check lock time, so we'll use metadata
-                        const currentTime = Date.now();
-                        const lastModified = metadata.lastModified || 0;
-                        const timeSinceLastUpdate = currentTime - lastModified;
-
-                        // If it's been more than 30 seconds since the last update,
-                        // the lock is likely stale
-                        if (timeSinceLastUpdate > lockTimeout) {
-                            LogUtils.debug(`Potential stale lock detected for task ${id} (${timeSinceLastUpdate}ms since update)`);
-                            shouldProcess = true;
-                        } else {
-                            // Don't add to sync queue here - this can cause double-syncing
-                            // The task will be properly synced once the lock is released or expires
-                            LogUtils.debug(`Task ${id} is locked, will be synced after lock is released`);
-                            // No enqueueTasks call to prevent double-sync
-                        }
-                    }
-
-                    if (shouldProcess) {
-                        try {
-                            state.addProcessingTask(id);
-
-                            // Update the metadata with the new task data
-                            // Get current version and increment it
-                            const currentVersion = metadata.version || 0;
-                            const newVersion = currentVersion + 1;
-
-                            // Generate an operation ID for better tracing
-                            const opId = `${id.substring(0, 4)}-${newVersion}-${Math.random().toString(36).substring(2, 5)}`;
-
-                            LogUtils.debug(`Updating task metadata for ${id} (op:${opId}) to version ${newVersion}`);
-
-                            const updatedMetadata = {
-                                ...metadata,
-                                title: task.title,
-                                date: task.date,
-                                time: task.time,
-                                endTime: task.endTime,
-                                reminder: task.reminder,
-                                completed: task.completed,
-                                completedDate: task.completedDate,
-                                lastModified: Date.now(),
-                                filePath: filePath || metadata.filePath,
-                                version: newVersion,
-                                syncOperationId: opId
-                            };
-
-                            // Update metadata in settings
-                            this.plugin.settings.taskMetadata[id] = updatedMetadata;
-                            await this.plugin.saveSettings();
-
-                            // Create a fresh task object that incorporates the latest changes
-                            // This ensures the task object passed to enqueueTasks reflects the current state
-                            const freshTask: Task = {
-                                ...task,
-                                title: updatedMetadata.title,
-                                date: updatedMetadata.date,
-                                time: updatedMetadata.time,
-                                endTime: updatedMetadata.endTime,
-                                reminder: updatedMetadata.reminder,
-                                completed: updatedMetadata.completed,
-                                completedDate: updatedMetadata.completedDate
-                            };
-
-                            // Ensure task is properly enqueued for sync
-                            if (state.isSyncAllowed()) {
-                                LogUtils.debug(`Enqueueing changed task ${id} for sync`);
-                                // Pass the freshTask to ensure it contains all changes
-                                await state.enqueueTasks([freshTask]);
-                            }
-                        } catch (error) {
-                            LogUtils.error(`Error updating task ${id}: ${error}`);
-                        } finally {
-                            state.removeProcessingTask(id);
-                        }
-                    } else {
-                        LogUtils.debug(`Task ${id} is locked, skipping metadata update`);
-                    }
-                } else {
-                    LogUtils.debug(`Task unchanged: ${id}`);
-                }
-            } else if (!state.isSyncAllowed()) {
-                LogUtils.debug('Sync is disabled, skipping metadata update');
-            }
+            // parseTask is a pure parsing function — no side effects.
+            // Sync enqueueing and metadata updates are handled by callers
+            // (parseTasksFromFile, processEditorChanges, etc.)
 
             return task;
         } catch (error) {
