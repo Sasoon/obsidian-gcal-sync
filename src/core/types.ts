@@ -125,40 +125,6 @@ export interface TaskIdMapping {
     to: number;
 }
 
-export interface GoogleCalendarEvent {
-    id: string;
-    summary: string;
-    start: {
-        date?: string;
-        dateTime?: string;
-        timeZone?: string;
-    };
-    end: {
-        date?: string;
-        dateTime?: string;
-        timeZone?: string;
-    };
-    extendedProperties?: {
-        private?: {
-            obsidianTaskId?: string;
-            isObsidianTask?: string;
-            version?: string;
-        };
-    };
-    reminders?: {
-        useDefault: boolean;
-        overrides?: Array<{
-            method: string;
-            minutes: number;
-        }>;
-    };
-}
-
-export interface TaskStore {
-    lastSyncTime: number;
-    lastSyncAttempt: number;
-}
-
 /**
  * Interface for parsed task data before full validation
  * Used in taskParser.ts for validating task data structure

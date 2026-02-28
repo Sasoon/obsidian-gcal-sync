@@ -561,20 +561,6 @@ export class RepairManager {
         return tasks;
     }
 
-    private async cleanupOrphanedEvent(eventId: string, taskId: string): Promise<void> {
-        try {
-            await this.plugin.calendarSync?.deleteEvent(eventId);
-            if (this.plugin.settings.taskMetadata[taskId]) {
-                delete this.plugin.settings.taskMetadata[taskId];
-                await this.plugin.saveSettings();
-            }
-            LogUtils.debug(`Deleted orphaned event ${eventId} for task ${taskId}`);
-        } catch (error) {
-            LogUtils.error(`Failed to delete orphaned event ${eventId}:`, error);
-            throw error;
-        }
-    }
-
     private async getMarkdownFiles(): Promise<TFile[]> {
         // Get all markdown files in the vault
         const allFiles = this.plugin.app.vault.getMarkdownFiles();
