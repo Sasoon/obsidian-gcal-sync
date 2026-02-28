@@ -1,7 +1,7 @@
 export const TIMING = {
     // Debounce delays
     FILE_CHANGE_DEBOUNCE_MS: 1000,
-    EDITOR_CHANGE_DEBOUNCE_MS: 500,
+    EDITOR_CHANGE_DEBOUNCE_MS: 200,
     FILE_SYSTEM_SETTLE_MS: 100,
 
     // Sync timing

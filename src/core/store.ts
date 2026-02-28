@@ -1,6 +1,9 @@
 import { createStore, type StateCreator } from 'zustand/vanilla';
 import { devtools, persist } from 'zustand/middleware';
 import { immer } from 'zustand/middleware/immer';
+
+// Only enable devtools in development
+const IS_DEV = typeof process !== 'undefined' && process.env?.NODE_ENV === 'development';
 import { enableMapSet } from 'immer';
 import type { Task, TaskMetadata } from './types';
 import { LogUtils } from '../utils/logUtils';
@@ -30,6 +33,9 @@ function simpleHash(str: string): string {
 
 // Enable Map and Set support for Immer
 enableMapSet();
+
+// Module-level cache for isSyncAllowed to avoid triggering Zustand subscribers on every call
+const _syncAllowedCacheExternal = { allowed: false, lastChecked: 0 };
 
 export interface TaskStore {
     // Sync State
@@ -168,12 +174,6 @@ export interface TaskStore {
     autoSyncCount: number;
     REPAIR_INTERVAL: number;
 
-    // Cache for sync allowed status
-    _syncAllowedCache: {
-        allowed: boolean;
-        lastChecked: number;
-        cacheTime: number; // Cache valid for 1 second
-    };
 }
 
 type TaskStoreState = Pick<TaskStore,
@@ -207,12 +207,6 @@ type PersistState = {
     syncEnabled?: boolean;
     authenticated?: boolean;
     taskVersions?: [string, number][];
-    processingTasks?: string[];
-    locks?: string[];
-    lockTimeouts?: [string, number][];
-    lockTimestamps?: [string, number][];
-    syncQueue?: string[];
-    failedSyncs?: [string, { error: Error; attempts: number }][];
     lastSyncTime?: number;
 };
 
@@ -257,25 +251,16 @@ const persistConfig: StorePersist = {
         syncEnabled: state.syncEnabled,
         authenticated: state.authenticated,
         taskVersions: Array.from(state.taskVersions.entries()),
-        processingTasks: Array.from(state.processingTasks),
-        locks: Array.from(state.locks),
-        lockTimeouts: Array.from(state.lockTimeouts.entries()),
-        lockTimestamps: Array.from(state.lockTimestamps.entries()),
-        syncQueue: Array.from(state.syncQueue),
-        failedSyncs: Array.from(state.failedSyncs.entries()),
         lastSyncTime: state.lastSyncTime || undefined
+        // NOTE: processingTasks, locks, lockTimeouts, lockTimestamps, syncQueue,
+        // and failedSyncs are ephemeral runtime state and must NOT be persisted.
+        // They are stale after a restart and cause tasks to appear permanently locked.
     }),
     merge: (persistedState, currentState) => ({
         ...currentState,
         syncEnabled: persistedState.syncEnabled ?? currentState.syncEnabled,
         authenticated: persistedState.authenticated ?? currentState.authenticated,
         taskVersions: new Map(persistedState.taskVersions || []),
-        processingTasks: new Set(persistedState.processingTasks || []),
-        locks: new Set(persistedState.locks || []),
-        lockTimeouts: new Map(persistedState.lockTimeouts || []),
-        lockTimestamps: new Map(persistedState.lockTimestamps || []),
-        syncQueue: new Set(persistedState.syncQueue || []),
-        failedSyncs: new Map(persistedState.failedSyncs || []),
         lastSyncTime: persistedState.lastSyncTime ?? currentState.lastSyncTime
     })
 };
@@ -424,19 +409,17 @@ export const store = createStore<TaskStore>()(
                     const queueSize = currentState.syncQueue.size;
                     const baseDelay = currentState.syncConfig.batchDelay;
 
-                    // Enhanced debounce logic:
-                    // 1. If we recently processed (< 1s ago), use longer delay
-                    // 2. If sync is in progress, use even longer delay
-                    // 3. Scale delay with queue size but with a reasonable cap
-                    const recentProcessDelay = timeSinceLastProcess < 1000 ? 500 : 0;
-                    const syncInProgressDelay = currentState.syncInProgress ? 800 : 0;
+                    // Lightweight debounce: small penalty if recently processed or sync in progress
+                    // to allow batching of rapid edits, but not so large as to feel sluggish
+                    const recentProcessDelay = timeSinceLastProcess < 500 ? 100 : 0;
+                    const syncInProgressDelay = currentState.syncInProgress ? 200 : 0;
 
                     const delay = Math.min(
                         baseDelay +
-                        Math.floor(baseDelay * Math.log(queueSize || 1) * 0.5) + // Reduced scaling factor
+                        Math.floor(baseDelay * Math.log(queueSize || 1) * 0.3) +
                         recentProcessDelay +
                         syncInProgressDelay,
-                        1500 // Reasonable maximum delay cap
+                        500 // Low maximum delay cap for snappy sync
                     );
 
                     // Set new timeout for processing
@@ -781,8 +764,6 @@ export const store = createStore<TaskStore>()(
                             // Store both an expiration time and the lock acquisition time
                             const now = Date.now();
                             state.lockTimeouts.set(taskId, now + TIMING.LOCK_TIMEOUT_MS);
-                            // Also store the actual lock timestamp for diagnostics
-                            state.lockTimestamps = state.lockTimestamps || new Map();
                             state.lockTimestamps.set(taskId, now);
                             LogUtils.debug(`Added processing task ${taskId} at ${new Date(now).toISOString()}`);
                         }
@@ -790,17 +771,16 @@ export const store = createStore<TaskStore>()(
 
                 removeProcessingTask: (taskId: string) =>
                     set(state => {
+                        // Capture lock duration before deleting the timestamp
+                        const startTime = state.lockTimestamps.get(taskId);
+                        const duration = startTime ? Date.now() - startTime : undefined;
+
                         state.processingTasks.delete(taskId);
                         state.locks.delete(taskId);
                         state.lockTimeouts.delete(taskId);
-                        // Also clear the lock timestamp if it exists
-                        if (state.lockTimestamps) {
-                            state.lockTimestamps.delete(taskId);
-                        }
-                        // Calculate and log lock duration if possible
-                        if (state.lockTimestamps && state.lockTimestamps.has(taskId)) {
-                            const startTime = state.lockTimestamps.get(taskId) || 0;
-                            const duration = Date.now() - startTime;
+                        state.lockTimestamps.delete(taskId);
+
+                        if (duration !== undefined) {
                             LogUtils.debug(`Removed processing task ${taskId} (lock held for ${duration}ms)`);
                         } else {
                             LogUtils.debug(`Removed processing task ${taskId}`);
@@ -908,57 +888,30 @@ export const store = createStore<TaskStore>()(
 
                 getLockTimestamp: (taskId: string) => {
                     const state = get();
-                    // Safely access the timestamps map which might not exist in older data
-                    if (!state.lockTimestamps) return undefined;
                     return state.lockTimestamps.get(taskId);
                 },
 
                 isSyncEnabled: () => {
-                    const state = get();
-                    const enabled = state.syncEnabled;
-                    LogUtils.debug(`🔄 Checking sync enabled: ${enabled}`);
-                    return enabled;
-                },
-
-                // Cache for sync allowed status
-                _syncAllowedCache: {
-                    allowed: false,
-                    lastChecked: 0,
-                    cacheTime: 200  // 200ms cache - very short to prevent issues
+                    return get().syncEnabled;
                 },
 
                 isSyncAllowed: () => {
                     const state = get();
                     const now = Date.now();
-                    const cache = state._syncAllowedCache;
 
-                    // Only use cache for rapid consecutive calls
-                    if (now - cache.lastChecked < cache.cacheTime) {
-                        return cache.allowed;
+                    // Use module-level cache to avoid triggering store subscribers
+                    if (now - _syncAllowedCacheExternal.lastChecked < 200) {
+                        return _syncAllowedCacheExternal.allowed;
                     }
 
                     const allowed = state.syncEnabled || state.tempSyncEnableCount > 0;
 
-                    // Update cache (without logging unless changed)
-                    if (allowed !== cache.allowed) {
+                    if (allowed !== _syncAllowedCacheExternal.allowed) {
                         LogUtils.debug(`🔄 Sync allowed status changed: ${allowed} (enabled: ${state.syncEnabled}, temp count: ${state.tempSyncEnableCount})`);
-
-                        set(state => {
-                            state._syncAllowedCache = {
-                                ...state._syncAllowedCache,
-                                allowed,
-                                lastChecked: now
-                            };
-                        });
-                    } else {
-                        // Silent update of lastChecked time only
-                        set(state => {
-                            state._syncAllowedCache = {
-                                ...state._syncAllowedCache,
-                                lastChecked: now
-                            };
-                        });
                     }
+
+                    _syncAllowedCacheExternal.allowed = allowed;
+                    _syncAllowedCacheExternal.lastChecked = now;
 
                     return allowed;
                 },
@@ -1115,13 +1068,9 @@ export const store = createStore<TaskStore>()(
                         }
 
                         try {
-                            // Create deep copies of objects to prevent reference issues
-                            const taskCopy = JSON.parse(JSON.stringify(task));
-                            const metadataCopy = JSON.parse(JSON.stringify(metadata));
-
                             state.taskCache.set(taskId, {
-                                task: taskCopy,
-                                metadata: metadataCopy,
+                                task: { ...task },
+                                metadata: { ...metadata },
                                 lastChecked: Date.now()
                             });
 
@@ -1149,12 +1098,10 @@ export const store = createStore<TaskStore>()(
                         const cached = state.taskCache.get(taskId);
                         const maxAge = state.cacheConfig.maxAge;
 
-                        // Use an even shorter cache time for reads
                         if (cached && Date.now() - cached.lastChecked < maxAge) {
-                            // Return deep copies to prevent mutations
                             return {
-                                task: JSON.parse(JSON.stringify(cached.task)),
-                                metadata: JSON.parse(JSON.stringify(cached.metadata))
+                                task: { ...cached.task },
+                                metadata: { ...cached.metadata }
                             };
                         }
                     } catch (error) {
@@ -1311,110 +1258,14 @@ export const store = createStore<TaskStore>()(
                         // Lock the task and process it
                         state.addProcessingTask(task.id);
 
-                        // CRITICAL: Enhanced task data verification but with optimizations
-                        let freshTask: Task = task; // Initialize with input task
-                        let taskChangedDuringProcess = false;
-
-                        try {
-                            if (state.plugin.taskParser) {
-                                // Get fresh task data - but only once by default for improved performance
-                                const initialTask = await state.plugin.taskParser.getTaskById(task.id);
-
-                                if (initialTask) {
-                                    // Compare original task with fresh task
-                                    const originalJson = JSON.stringify({
-                                        title: task.title,
-                                        date: task.date,
-                                        time: task.time,
-                                        endTime: task.endTime,
-                                        reminder: task.reminder,
-                                        completed: task.completed
-                                    });
-
-                                    const freshJson = JSON.stringify({
-                                        title: initialTask.title,
-                                        date: initialTask.date,
-                                        time: initialTask.time,
-                                        endTime: initialTask.endTime,
-                                        reminder: initialTask.reminder,
-                                        completed: initialTask.completed
-                                    });
-
-                                    if (originalJson !== freshJson) {
-                                        // Only log if there's an actual change
-                                        LogUtils.debug(`Task ${task.id} changed during retrieval:
-                                            Original: title='${task.title}', date=${task.date}, time=${task.time}
-                                            Current: title='${initialTask.title}', date=${initialTask.date}, time=${initialTask.time}`);
-
-                                        freshTask = initialTask;
-                                        taskChangedDuringProcess = true;
-                                    } else {
-                                        // No change detected, use original task data
-                                        LogUtils.debug(`Task ${task.id} unchanged during retrieval`);
-                                    }
-                                }
-
-                                // Only do a second check if we detected an initial change
-                                // This reduces unnecessary file reads for stable tasks
-                                if (taskChangedDuringProcess) {
-                                    // Wait briefly (100ms) for potential additional changes
-                                    await new Promise(resolve => setTimeout(resolve, 100));
-
-                                    // Perform one final check to catch very recent edits
-                                    const finalTask = await state.plugin.taskParser.getTaskById(task.id);
-                                    if (finalTask) {
-                                        const newFreshJson = JSON.stringify({
-                                            title: finalTask.title,
-                                            date: finalTask.date,
-                                            time: finalTask.time,
-                                            endTime: finalTask.endTime,
-                                            reminder: finalTask.reminder,
-                                            completed: finalTask.completed
-                                        });
-
-                                        const currentFreshJson = JSON.stringify({
-                                            title: freshTask.title,
-                                            date: freshTask.date,
-                                            time: freshTask.time,
-                                            endTime: freshTask.endTime,
-                                            reminder: freshTask.reminder,
-                                            completed: freshTask.completed
-                                        });
-
-                                        if (newFreshJson !== currentFreshJson) {
-                                            LogUtils.debug(`Task ${task.id} changed again during final check:
-                                                Before: title='${freshTask.title}', date=${freshTask.date}
-                                                After: title='${finalTask.title}', date=${finalTask.date}`);
-
-                                            freshTask = finalTask;
-                                        }
-                                    }
-                                }
-                            }
-                        } catch (err) {
-                            // If we can't get fresh data, use the original task
-                            LogUtils.debug(`Couldn't get fresh task data for ${task.id}, using provided data`);
-                            // freshTask is already initialized with task
-                        }
-
-                        // Get metadata
-                        const metadata = state.getTaskMetadata(task.id);
-
-                        // Check if task has changed using shared implementation
-                        const result = hasTaskChanged(freshTask, metadata, task.id);
-                        const hasChanged = result.changed;
-
-                        // Always sync if we're explicitly calling syncTask, even if hasChanged is false
-                        // This ensures tasks are synced when they're manually processed
-                        if (hasChanged === false) {
-                            LogUtils.debug(`Task ${task.id} appears unchanged, but syncing anyway to ensure consistency`);
-                        }
-
-                        // Log the actual data we're syncing to help with debugging
-                        LogUtils.debug(`Syncing task ${task.id} with title='${freshTask.title}', date=${freshTask.date}, reminder=${freshTask.reminder}`);
+                        // Trust the task data provided by the caller — processSyncQueue already
+                        // parsed fresh data from files, and editor handlers parse at the cursor line.
+                        // Re-fetching here added 200ms+ of latency per task with no practical benefit
+                        // since the debounce window already coalesces rapid edits.
+                        LogUtils.debug(`Syncing task ${task.id} with title='${task.title}', date=${task.date}, reminder=${task.reminder}`);
 
                         // Sync the task with calendar
-                        await state.plugin.calendarSync?.syncTask(freshTask);
+                        await state.plugin.calendarSync?.syncTask(task);
 
                         // Update task version
                         state.updateTaskVersion(task.id, Date.now());
@@ -1422,7 +1273,7 @@ export const store = createStore<TaskStore>()(
                         // Cache the current state - with updated task data
                         const updatedMetadata = state.plugin.settings.taskMetadata[task.id];
                         if (updatedMetadata) {
-                            state.cacheTask(task.id, freshTask, updatedMetadata);
+                            state.cacheTask(task.id, task, updatedMetadata);
                         }
                     } catch (error) {
                         LogUtils.error(`Failed to sync task ${task.id}:`, error);
@@ -1439,7 +1290,8 @@ export const store = createStore<TaskStore>()(
                 autoSyncCount: 0,
                 REPAIR_INTERVAL: 10, // Run repair every 10 auto syncs
             })), persistConfig
-        )
+        ),
+        { enabled: IS_DEV }
     )
 );
 
