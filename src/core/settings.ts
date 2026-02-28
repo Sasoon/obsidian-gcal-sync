@@ -13,7 +13,7 @@ export const DEFAULT_SETTINGS: GoogleCalendarSettings = {
     includeFolders: [],  // Empty by default to scan all folders
     taskMetadata: {},
     taskIds: {},
-    verboseLogging: true,  // Default to false for new users
+    verboseLogging: false,
     hasCompletedOnboarding: true,  // Set to true to prevent welcome modal on startup
     mobileSyncLimit: 100,  // Default to 100 files on mobile
     mobileOptimizations: true,  // Enable mobile optimizations by default
@@ -122,19 +122,24 @@ export class GoogleCalendarSettingsTab extends PluginSettingTab {
 
         const oauthDesc = containerEl.createEl('div', { cls: 'setting-item-description' });
         oauthDesc.style.marginBottom = '1em';
-        oauthDesc.innerHTML = `
-            <p>If you're seeing "This app is blocked" errors, you can use your own Google Cloud OAuth credentials:</p>
-            <ol>
-                <li>Go to <a href="https://console.cloud.google.com/">Google Cloud Console</a></li>
-                <li>Create a new project (or select existing)</li>
-                <li>Enable the Google Calendar API</li>
-                <li>Go to "Credentials" → "Create Credentials" → "OAuth client ID"</li>
-                <li>Choose "Desktop app" as the application type</li>
-                <li>Copy the Client ID and Client Secret below</li>
-                <li>Add <code>http://127.0.0.1:8085/callback</code> to Authorized redirect URIs</li>
-            </ol>
-            <p><strong>Note:</strong> After changing credentials, disconnect and reconnect your Google account.</p>
-        `;
+
+        oauthDesc.createEl('p', { text: 'If you\'re seeing "This app is blocked" errors, you can use your own Google Cloud OAuth credentials:' });
+        const ol = oauthDesc.createEl('ol');
+        const step1 = ol.createEl('li');
+        step1.appendText('Go to ');
+        step1.createEl('a', { text: 'Google Cloud Console', href: 'https://console.cloud.google.com/' });
+        ol.createEl('li', { text: 'Create a new project (or select existing)' });
+        ol.createEl('li', { text: 'Enable the Google Calendar API' });
+        ol.createEl('li', { text: 'Go to "Credentials" \u2192 "Create Credentials" \u2192 "OAuth client ID"' });
+        ol.createEl('li', { text: 'Choose "Desktop app" as the application type' });
+        ol.createEl('li', { text: 'Copy the Client ID and Client Secret below' });
+        const step7 = ol.createEl('li');
+        step7.appendText('Add ');
+        step7.createEl('code', { text: 'http://127.0.0.1:8085/callback' });
+        step7.appendText(' to Authorized redirect URIs');
+        const noteP = oauthDesc.createEl('p');
+        noteP.createEl('strong', { text: 'Note:' });
+        noteP.appendText(' After changing credentials, disconnect and reconnect your Google account.');
 
         new Setting(containerEl)
             .setName('Custom Client ID')
