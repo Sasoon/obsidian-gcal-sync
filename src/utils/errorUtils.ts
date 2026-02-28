@@ -2,6 +2,16 @@ import { ERROR_MESSAGES } from '../config/constants';
 
 export class ErrorUtils {
     /**
+     * Check if an error indicates a Google Calendar event no longer exists (404/410)
+     */
+    static isEventGoneError(error: unknown): boolean {
+        if (!(error instanceof Error)) return false;
+        return error.message.includes('status 404') ||
+            error.message.includes('status 410') ||
+            error.message.includes('Event already deleted');
+    }
+
+    /**
      * Check if an error is network related
      */
     static isNetworkError(error: any): boolean {
