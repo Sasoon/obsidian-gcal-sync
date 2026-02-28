@@ -27,15 +27,8 @@ export class GoogleAuthManager {
     private codeVerifier: string | null = null;
     private app: App;
     private encryptionKey: CryptoKey | null = null;
+    private refreshPromise: Promise<OAuth2Tokens> | null = null;
 
-    /**
-     * Sanitize text for logging to prevent sensitive data leakage (tokens, secrets, etc.)
-     */
-    private sanitizeForLogging(text: string | undefined, maxLength = 100): string {
-        if (!text) return '[empty]';
-        if (text.length <= maxLength) return text;
-        return text.substring(0, maxLength) + '...(truncated)';
-    }
 
     /**
      * Sanitize a JSON response object for logging - removes sensitive fields
@@ -48,7 +41,7 @@ export class GoogleAuthManager {
         if (sanitized.refresh_token) sanitized.refresh_token = '[REDACTED]';
         if (sanitized.id_token) sanitized.id_token = '[REDACTED]';
         if (sanitized.error_description) {
-            sanitized.error_description = this.sanitizeForLogging(sanitized.error_description);
+            sanitized.error_description = LogUtils.sanitize(sanitized.error_description);
         }
         return JSON.stringify(sanitized);
     }
@@ -91,7 +84,7 @@ export class GoogleAuthManager {
 
         // Use vault path + plugin ID as salt for key derivation
         // This ties the encrypted tokens to this specific vault installation
-        const vaultPath = (this.app.vault.adapter as any).basePath || 'obsidian-vault';
+        const vaultPath = (this.app.vault.adapter as any).basePath || this.app.vault.getName();
         const salt = CryptoUtils.generateVaultSalt(vaultPath, 'obsidian-gcal-sync');
 
         this.encryptionKey = await CryptoUtils.deriveKey(salt);
@@ -130,7 +123,7 @@ export class GoogleAuthManager {
                 });
 
                 const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
-                console.log('🔐 Full auth URL:', authUrl);
+                console.log('🔐 Auth URL generated (details redacted for security)');
 
                 try {
                     console.log('🔐 Waiting for auth code...');
@@ -236,8 +229,8 @@ export class GoogleAuthManager {
             });
 
             const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
-            console.log('🔐 Mobile auth URL:', authUrl);
-            console.log('🔐 IMPORTANT - Exact redirect_uri being sent:', this.redirectUri);
+            console.log('🔐 Mobile auth URL generated (details redacted for security)');
+            console.log('🔐 Redirect URI:', this.redirectUri);
 
             // Open the authorization URL in the browser
             window.open(authUrl, '_blank');
@@ -261,7 +254,6 @@ export class GoogleAuthManager {
             }
 
             console.log('🔄 Exchanging auth code for tokens using PKCE flow');
-            console.log('Code verifier length:', this.codeVerifier.length);
             console.log('Redirect URI:', this.redirectUri);
 
             let response: any;
@@ -295,11 +287,7 @@ export class GoogleAuthManager {
                     client_id: this.clientId
                 };
 
-                console.log('Token exchange request:', JSON.stringify({
-                    ...requestBody,
-                    code: code.substring(0, 5) + '...',  // Only log part of the code for security
-                    code_verifier: this.codeVerifier.substring(0, 5) + '...'  // Only log part of the verifier for security
-                }, null, 2));
+                console.log('Token exchange request: operation=exchange_code_pkce, code=[REDACTED], code_verifier=[REDACTED]');
 
                 response = await requestUrl({
                     url: 'https://obsidian-gcal-sync-netlify-oauth.netlify.app/.netlify/functions/token-exchange',
@@ -314,7 +302,7 @@ export class GoogleAuthManager {
             console.log('Token exchange response status:', response.status);
 
             if (response.status >= 400) {
-                console.error('❌ Error response from token exchange:', response.status, this.sanitizeForLogging(response.text));
+                console.error('❌ Error response from token exchange:', response.status, LogUtils.sanitize(response.text));
                 throw new Error(`Token exchange failed with status ${response.status}`);
             }
 
@@ -575,7 +563,7 @@ export class GoogleAuthManager {
             }
 
             if (response.status >= 400) {
-                console.error('❌ Error response from token exchange:', response.status, this.sanitizeForLogging(response.text));
+                console.error('❌ Error response from token exchange:', response.status, LogUtils.sanitize(response.text));
                 throw new Error(`Oauth server returned error ${response.status}`);
             }
 
@@ -636,7 +624,7 @@ export class GoogleAuthManager {
                 console.log('🔄 Netlify response status:', response.status);
             }
             if (response.status >= 400) {
-                console.error('Token refresh failed with status', response.status, this.sanitizeForLogging(response.text));
+                console.error('Token refresh failed with status', response.status, LogUtils.sanitize(response.text));
                 throw new Error(`Token refresh failed with status ${response.status}`);
             }
 
@@ -798,7 +786,7 @@ export class GoogleAuthManager {
         if (!this.accessToken || !this.tokenExpiry) {
             if (await this.loadSavedTokens()) {
                 if (this.tokenExpiry && Date.now() >= this.tokenExpiry) {
-                    const tokens = await this.refreshAccessToken();
+                    const tokens = await this.deduplicatedRefresh();
                     return tokens.access_token;
                 }
                 return this.accessToken!;
@@ -807,11 +795,27 @@ export class GoogleAuthManager {
         }
 
         if (Date.now() >= this.tokenExpiry) {
-            const tokens = await this.refreshAccessToken();
+            const tokens = await this.deduplicatedRefresh();
             return tokens.access_token;
         }
 
         return this.accessToken;
+    }
+
+    /**
+     * Deduplicates concurrent refresh calls so only one HTTP request is made.
+     * Subsequent callers await the same in-flight promise.
+     */
+    private async deduplicatedRefresh(): Promise<OAuth2Tokens> {
+        if (this.refreshPromise) {
+            return this.refreshPromise;
+        }
+
+        this.refreshPromise = this.refreshAccessToken().finally(() => {
+            this.refreshPromise = null;
+        });
+
+        return this.refreshPromise;
     }
 
     async revokeAccess(): Promise<void> {
